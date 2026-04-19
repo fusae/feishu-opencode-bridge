@@ -16,6 +16,7 @@ const opencode = new OpencodeDaemon(env);
 await opencode.start();
 
 const queues = new Map<string, Promise<void>>();
+const inflightMessageIds = new Set<string>();
 
 await feishu.start({
   onMessage: async (data) => {
@@ -23,8 +24,12 @@ await feishu.start({
     if (messageId && state.hasProcessedMessage(messageId)) {
       return;
     }
+    if (messageId && inflightMessageIds.has(messageId)) {
+      await logLine(`[message] drop reason=inflight_duplicate messageId=${messageId}`);
+      return;
+    }
 
-    const verdict = feishu.shouldHandleMessage(data, env.groupRequireMention);
+    const verdict = await feishu.shouldHandleMessage(data, env.groupRequireMention);
     if (verdict === "skip") {
       if (messageId) {
         await state.markProcessedMessage(messageId);
@@ -50,6 +55,9 @@ await feishu.start({
       return;
     }
 
+    if (messageId) {
+      inflightMessageIds.add(messageId);
+    }
     await logLine(`[message] enqueue chat=${chatId} messageId=${messageId ?? ""}`);
     enqueue(chatId, async () => {
       try {
@@ -62,11 +70,12 @@ await feishu.start({
         console.error(error);
         await logError("handleMessage", error, { chatId, messageId });
         await feishu.sendText(chatId, `处理失败：${formatError(error)}`);
+      } finally {
+        if (messageId) {
+          inflightMessageIds.delete(messageId);
+        }
       }
     });
-  },
-  onUnsupportedMessage: async (chatId, messageType) => {
-    await feishu.sendText(chatId, `暂不支持 ${messageType} 类型的消息，请发送文本消息。`);
   },
   onCardAction: async (event, value) => {
     const token = typeof event?.token === "string" ? event.token : undefined;

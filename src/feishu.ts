@@ -108,6 +108,9 @@ export class FeishuBridgeClient {
   }
 
   private async fetchBotOpenId(): Promise<void> {
+    if (this.botOpenId) {
+      return;
+    }
     try {
       const resp: any = await this.client.request({
         method: "GET",
@@ -125,7 +128,6 @@ export class FeishuBridgeClient {
 
   async start(params: {
     onMessage: (data: any) => Promise<void>;
-    onUnsupportedMessage: (chatId: string, messageType: string) => Promise<void>;
     onCardAction: (event: any, value: CardActionValue) => Promise<void>;
   }): Promise<void> {
     await this.fetchBotOpenId();
@@ -189,7 +191,7 @@ export class FeishuBridgeClient {
     return data?.message?.message_type;
   }
 
-  shouldHandleMessage(data: any, requireMentionInGroup: boolean): "handle" | "unsupported" | "skip" {
+  async shouldHandleMessage(data: any, requireMentionInGroup: boolean): Promise<"handle" | "unsupported" | "skip"> {
     const chatId = this.getChatId(data);
     const messageId = this.getMessageId(data);
     if (!chatId || !messageId) {
@@ -199,10 +201,15 @@ export class FeishuBridgeClient {
     const isGroup = this.getChatType(data) === "group";
 
     if (isGroup && requireMentionInGroup) {
+      if (!this.botOpenId) {
+        await this.fetchBotOpenId();
+      }
+      if (!this.botOpenId) {
+        await logLine(`[message] drop reason=bot_open_id_unavailable messageId=${messageId}`);
+        return "skip";
+      }
       const mentions = Array.isArray(data?.message?.mentions) ? data.message.mentions : [];
-      const mentionsBot = this.botOpenId
-        ? mentions.some((m: any) => m?.id?.open_id === this.botOpenId || m?.id === this.botOpenId)
-        : mentions.length > 0;
+      const mentionsBot = mentions.some((m: any) => m?.id?.open_id === this.botOpenId || m?.id === this.botOpenId);
       if (!mentionsBot) {
         return "skip";
       }
