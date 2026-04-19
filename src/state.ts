@@ -1,10 +1,11 @@
 import path from "node:path";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import type { ChatBinding, PendingSelector, StateData } from "./types.js";
+import type { ChatBinding, PendingQuestion, PendingSelector, StateData } from "./types.js";
 
 const EMPTY_STATE: StateData = {
   bindings: {},
   pendingSelectors: {},
+  pendingQuestions: {},
   processedMessageIds: [],
   processedActionTokens: [],
 };
@@ -22,6 +23,7 @@ export class StateStore {
       this.state = {
         bindings: parsed.bindings ?? {},
         pendingSelectors: parsed.pendingSelectors ?? {},
+        pendingQuestions: parsed.pendingQuestions ?? {},
         processedMessageIds: parsed.processedMessageIds ?? [],
         processedActionTokens: parsed.processedActionTokens ?? [],
       };
@@ -64,6 +66,10 @@ export class StateStore {
     return this.state.pendingSelectors[chatId];
   }
 
+  getPendingQuestion(chatId: string): PendingQuestion | undefined {
+    return this.state.pendingQuestions[chatId];
+  }
+
   async setPendingSelector(chatId: string, selector: PendingSelector): Promise<void> {
     this.state.pendingSelectors[chatId] = selector;
     await this.flush();
@@ -83,6 +89,16 @@ export class StateStore {
 
   async clearPendingSelector(chatId: string): Promise<void> {
     delete this.state.pendingSelectors[chatId];
+    await this.flush();
+  }
+
+  async setPendingQuestion(chatId: string, question: PendingQuestion): Promise<void> {
+    this.state.pendingQuestions[chatId] = question;
+    await this.flush();
+  }
+
+  async clearPendingQuestion(chatId: string): Promise<void> {
+    delete this.state.pendingQuestions[chatId];
     await this.flush();
   }
 

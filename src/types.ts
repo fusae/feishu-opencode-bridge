@@ -26,9 +26,15 @@ export interface PendingSelector {
   pendingPrompt?: string;
 }
 
+export interface PendingQuestion {
+  sessionId: string;
+  questions: string[];
+}
+
 export interface StateData {
   bindings: Record<string, ChatBinding>;
   pendingSelectors: Record<string, PendingSelector>;
+  pendingQuestions: Record<string, PendingQuestion>;
   processedMessageIds: string[];
   processedActionTokens: string[];
 }

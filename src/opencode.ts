@@ -1,4 +1,4 @@
-import { createOpencodeClient, createOpencodeServer, type OpencodeClient } from "@opencode-ai/sdk";
+import { createOpencodeClient, createOpencodeServer, type OpencodeClient, type Part } from "@opencode-ai/sdk";
 import type { BridgeEnv } from "./types.js";
 
 const POLL_INTERVAL_MS = 1500;
@@ -16,6 +16,39 @@ function extractText(parts: Array<{ type: string; text?: string }>): string {
     .join("\n\n")
     .trim();
 }
+
+function extractQuestions(parts: Part[]): string[] {
+  const questions: string[] = [];
+
+  for (const part of parts) {
+    if (part.type !== "tool" || part.tool !== "question") {
+      continue;
+    }
+
+    if (part.state.status !== "pending" && part.state.status !== "running") {
+      continue;
+    }
+
+    const input = part.state.input as { questions?: Array<{ question?: string }> };
+    for (const item of input.questions ?? []) {
+      if (typeof item.question === "string" && item.question.trim()) {
+        questions.push(item.question.trim());
+      }
+    }
+  }
+
+  return questions;
+}
+
+export type PromptResult =
+  | {
+      type: "reply";
+      text: string;
+    }
+  | {
+      type: "question";
+      questions: string[];
+    };
 
 export class OpencodeDaemon {
   private serverUrl?: string;
@@ -52,7 +85,7 @@ export class OpencodeDaemon {
     return result.data.id;
   }
 
-  async prompt(directory: string, sessionId: string, text: string): Promise<string> {
+  async prompt(directory: string, sessionId: string, text: string): Promise<PromptResult> {
     const client = this.getClient(directory);
     const beforeMessages = await client.session.messages({
       path: { id: sessionId },
@@ -111,6 +144,15 @@ export class OpencodeDaemon {
         throw new Error(JSON.stringify(assistantInfo.error));
       }
 
+      const questions = extractQuestions(latestAssistant.parts ?? []);
+      if (questions.length > 0) {
+        await this.abort(directory, sessionId);
+        return {
+          type: "question",
+          questions,
+        };
+      }
+
       if (!assistantInfo.time.completed) {
         continue;
       }
@@ -119,10 +161,23 @@ export class OpencodeDaemon {
       if (!reply) {
         throw new Error("opencode returned empty text response");
       }
-      return reply;
+      return {
+        type: "reply",
+        text: reply,
+      };
     }
 
     throw new Error("opencode response timeout");
+  }
+
+  async abort(directory: string, sessionId: string): Promise<void> {
+    const client = this.getClient(directory);
+    const result = await client.session.abort({
+      path: { id: sessionId },
+    });
+    if (result.error && result.response?.status !== 400) {
+      throw new Error(JSON.stringify(result.error));
+    }
   }
 
   private getClient(directory: string): OpencodeClient {

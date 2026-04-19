@@ -84,6 +84,18 @@ async function handleMessage(chatId: string, data: any): Promise<void> {
   }
 
   const binding = state.getBinding(chatId);
+  const pendingQuestion = state.getPendingQuestion(chatId);
+  if (binding && pendingQuestion) {
+    await state.clearPendingQuestion(chatId);
+    const result = await opencode.prompt(
+      binding.directory,
+      pendingQuestion.sessionId,
+      buildQuestionAnswerPrompt(pendingQuestion.questions, text),
+    );
+    await deliverPromptResult(chatId, pendingQuestion.sessionId, result);
+    return;
+  }
+
   if (!binding) {
     await startSelector(chatId, text);
     return;
@@ -94,8 +106,8 @@ async function handleMessage(chatId: string, data: any): Promise<void> {
     await state.updateBinding(chatId, { sessionId });
   }
 
-  const reply = await opencode.prompt(binding.directory, sessionId, text);
-  await feishu.sendText(chatId, reply);
+  const result = await opencode.prompt(binding.directory, sessionId, text);
+  await deliverPromptResult(chatId, sessionId, result);
   console.log(
     `[bridge] chat=${chatId} session=${sessionId} duration_ms=${Date.now() - startedAt} text=${JSON.stringify(text.slice(0, 80))}`,
   );
@@ -107,6 +119,7 @@ async function handleCommand(chatId: string, text: string): Promise<boolean> {
 
   if (trimmed === "/switch") {
     await state.clearBinding(chatId);
+    await state.clearPendingQuestion(chatId);
     await startSelector(chatId);
     return true;
   }
@@ -128,6 +141,7 @@ async function handleCommand(chatId: string, text: string): Promise<boolean> {
       return true;
     }
     await state.updateBinding(chatId, { sessionId: undefined });
+    await state.clearPendingQuestion(chatId);
     await feishu.sendText(chatId, "已重置当前目录对应的 OpenCode 会话。");
     return true;
   }
@@ -276,8 +290,21 @@ async function bindProjectAndReplay(chatId: string, directory: string, pendingPr
 
   const sessionId = await opencode.createSession(directory, `Feishu ${chatId}`);
   await state.updateBinding(chatId, { sessionId });
-  const reply = await opencode.prompt(directory, sessionId, pendingPrompt);
-  await feishu.sendText(chatId, reply);
+  const result = await opencode.prompt(directory, sessionId, pendingPrompt);
+  await deliverPromptResult(chatId, sessionId, result);
+}
+
+async function deliverPromptResult(chatId: string, sessionId: string, result: Awaited<ReturnType<OpencodeDaemon["prompt"]>>): Promise<void> {
+  if (result.type === "reply") {
+    await feishu.sendText(chatId, result.text);
+    return;
+  }
+
+  await state.setPendingQuestion(chatId, {
+    sessionId,
+    questions: result.questions,
+  });
+  await feishu.sendText(chatId, formatQuestions(result.questions));
 }
 
 function enqueue(key: string, task: () => Promise<void>): void {
@@ -329,6 +356,27 @@ function formatError(error: unknown): string {
     return error.message;
   }
   return String(error);
+}
+
+function buildQuestionAnswerPrompt(questions: string[], answer: string): string {
+  return [
+    "你刚才向用户追问了这些补充信息：",
+    ...questions.map((question, index) => `${index + 1}. ${question}`),
+    "",
+    "用户的统一回复如下：",
+    answer,
+    "",
+    "请基于这些补充信息继续完成刚才的任务，不要重复追问相同内容。",
+  ].join("\n");
+}
+
+function formatQuestions(questions: string[]): string {
+  return [
+    "需要补充信息：",
+    ...questions.map((question, index) => `${index + 1}. ${question}`),
+    "",
+    "直接回复这一条消息即可。",
+  ].join("\n");
 }
 
 function shutdown(): void {
