@@ -1,23 +1,49 @@
 # Feishu OpenCode Bridge
 
-本地常驻守护进程。
+Connect a Feishu bot to [OpenCode](https://opencode.ai/) with:
 
-- 用飞书官方长连接接收消息
-- 自动启动一个 `opencode serve`
-- 首次聊天时扫描 `~/Projects` 下的子目录
-- 在飞书里发项目列表卡片和按钮
-- 点击按钮后，把当前聊天绑定到对应目录
-- 后续消息直接进入该目录下的 `opencode session`
+- Feishu persistent connection mode
+- interactive project picker from `~/Projects`
+- per-chat directory binding
+- per-chat OpenCode session reuse
 
-## 安装
+This project is useful when you want to talk to different local codebases from Feishu without manually switching directories in a terminal.
+
+## How It Works
+
+1. A user sends a message to the Feishu bot.
+2. If the chat is not bound yet, the bridge scans `PROJECTS_ROOT` and sends a project picker card.
+3. After a project is selected, the chat is bound to that directory.
+4. The bridge starts or reuses one OpenCode session for that chat and directory.
+5. Later messages in the same chat continue in the same session.
+
+## Features
+
+- Feishu message events via persistent connection
+- Feishu card action events via persistent connection
+- project selection buttons with pagination
+- fallback text commands for switching and searching
+- one OpenCode server process managed by the bridge
+- one OpenCode session per Feishu chat
+
+## Requirements
+
+- Node.js 22+
+- `opencode` installed and available in `PATH`
+- a Feishu self-built app with bot capability enabled
+
+## Installation
 
 ```bash
-cd /Users/jamesyu/Projects/feishu-opencode-bridge
+git clone https://github.com/fusae/feishu-opencode-bridge.git
+cd feishu-opencode-bridge
 npm install
 cp .env.example .env
 ```
 
-## `.env`
+## Configuration
+
+Edit `.env`:
 
 ```env
 FEISHU_APP_ID=cli_xxx
@@ -33,51 +59,90 @@ OPENCODE_SERVER_HOSTNAME=127.0.0.1
 OPENCODE_SERVER_PORT=4096
 OPENCODE_SERVER_USERNAME=opencode
 OPENCODE_SERVER_PASSWORD=
-OPENCODE_SYSTEM_PROMPT=你正在通过飞书为当前项目提供支持，回复先给结果，再给必要细节。
+OPENCODE_SYSTEM_PROMPT=You are helping with the currently bound project. Give the answer first, then the necessary detail.
 ```
 
-如果你的 `opencode serve` 需要密码，就填 `OPENCODE_SERVER_PASSWORD`；桥接会自己启动它并自动走 Basic Auth。
+Notes:
 
-## 启动
+- `PROJECTS_ROOT` is scanned for first-level subdirectories.
+- `GROUP_REQUIRE_MENTION=true` means the bot only reacts when mentioned in group chats.
+- `OPENCODE_SERVER_PASSWORD` is optional. If set, the bridge uses HTTP Basic Auth when talking to `opencode serve`.
+
+## Run
+
+Development:
 
 ```bash
-cd /Users/jamesyu/Projects/feishu-opencode-bridge
 npm run dev
 ```
 
-## 飞书开放平台配置
+Production:
 
-- 创建自建应用并开启 `Bot`
-- 开启事件订阅
-- 订阅 `im.message.receive_v1`
-- 订阅 `card.action.trigger`
-- 接入方式选择长连接
-- 给应用开收消息、发消息权限
-
-这版和 OpenClaw 一样，消息和卡片动作都走长连接，不需要单独卡片回调地址。
-
-## 对话流程
-
-1. 首次给机器人发消息
-2. 机器人返回项目列表卡片
-3. 点击项目按钮
-4. 机器人绑定目录并自动处理你刚才那条消息
-5. 后续继续聊即可
-
-## 命令
-
-```text
-/switch    重新选项目
-/status    查看当前绑定目录
-/reset     清空当前 OpenCode 会话
-/next      项目列表下一页
-/prev      项目列表上一页
-/search 关键词
+```bash
+npm run build
+npm start
 ```
 
-## 说明
+## Feishu App Setup
 
-- 目录列表默认读取 `~/Projects` 的一级子目录
-- 消息和卡片动作都走长连接事件
-- 按钮能直接选项目；文本编号仍可作为兜底
-- 选择结果和会话绑定会持久化到 `data/state.json`
+In the Feishu developer console:
+
+1. Create a self-built app.
+2. Enable `Bot`.
+3. Enable events and callbacks.
+4. Choose persistent connection mode.
+5. Subscribe to:
+   - `im.message.receive_v1`
+   - `card.action.trigger`
+6. Grant message receive/send permissions required by your app.
+
+No separate public webhook endpoint is required for this bridge.
+
+## Chat Commands
+
+```text
+/switch    Open the project picker again
+/status    Show the currently bound directory
+/reset     Reset the current OpenCode session for this chat
+/next      Next page in the project picker
+/prev      Previous page in the project picker
+/search x  Filter projects by keyword
+```
+
+## State
+
+Runtime state is stored in:
+
+```text
+data/state.json
+```
+
+It keeps:
+
+- chat -> directory binding
+- chat -> session binding
+- pending selector state
+- processed message/card tokens for deduplication
+
+## Current Behavior
+
+- one Feishu chat maps to one project directory
+- one Feishu chat maps to one OpenCode session inside that directory
+- messages in the same chat are processed serially to preserve session order
+- project picker uses buttons, with text-command fallback still available
+
+## Troubleshooting
+
+If the bot does not reply:
+
+- confirm the Feishu app is using persistent connection mode
+- confirm both `im.message.receive_v1` and `card.action.trigger` are subscribed
+- confirm `opencode` is installed and callable from the shell
+- confirm `FEISHU_APP_ID` and `FEISHU_APP_SECRET` are correct
+- inspect bridge logs from `npm run dev`
+
+If replies are slow:
+
+- the bridge waits for OpenCode to finish before replying
+- messages from the same chat are queued in order
+- large repositories or tool-heavy prompts may take noticeably longer
