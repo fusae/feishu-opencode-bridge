@@ -1,191 +1,283 @@
-import express from "express";
-import { loadEnv, loadProjects } from "./config.js";
-import { FeishuClient } from "./feishu.js";
-import { OpencodeRegistry } from "./opencode.js";
+import process from "node:process";
+import { loadEnv } from "./config.js";
+import { FeishuBridgeClient } from "./feishu.js";
+import { OpencodeDaemon } from "./opencode.js";
+import { filterProjectDirectories, listProjectDirectories } from "./projects.js";
 import { StateStore } from "./state.js";
-import type { FeishuEventEnvelope, ProjectConfig } from "./types.js";
+import type { CardActionValue } from "./types.js";
 
 const env = loadEnv();
-const projectConfig = await loadProjects(env.projectsConfigPath);
 const state = new StateStore(env.stateFilePath);
 await state.init();
 
-const feishu = new FeishuClient(env);
-const opencode = new OpencodeRegistry();
-const app = express();
+const feishu = new FeishuBridgeClient(env);
+const opencode = new OpencodeDaemon(env);
+await opencode.start();
+
 const queues = new Map<string, Promise<void>>();
 
-app.use(express.json({ limit: "1mb" }));
-
-app.get("/healthz", (_req, res) => {
-  res.json({
-    ok: true,
-    projects: [...projectConfig.projects.keys()],
-    defaultProjectKey: projectConfig.defaultProjectKey ?? null,
-  });
-});
-
-app.post("/feishu/events", async (req, res) => {
-  const payload = req.body as FeishuEventEnvelope;
-
-  if (!feishu.verifyToken(payload)) {
-    res.status(401).json({ code: 401, message: "invalid token" });
-    return;
-  }
-
-  if (feishu.isUrlVerification(payload)) {
-    res.json({ challenge: payload.challenge });
-    return;
-  }
-
-  const eventType = feishu.getEventType(payload);
-  if (eventType !== "im.message.receive_v1" || !payload.event) {
-    res.json({ code: 0 });
-    return;
-  }
-
-  const eventId = feishu.getEventId(payload);
-  if (eventId && state.hasProcessedEvent(eventId)) {
-    res.json({ code: 0 });
-    return;
-  }
-
-  const chatId = payload.event.message?.chat_id;
-  if (!chatId || !feishu.shouldHandleMessage(payload.event, env.groupRequireMention)) {
-    if (eventId) {
-      await state.markProcessedEvent(eventId);
+await feishu.start({
+  onMessage: async (data) => {
+    const messageId = feishu.getMessageId(data);
+    if (messageId && state.hasProcessedMessage(messageId)) {
+      return;
     }
-    res.json({ code: 0 });
-    return;
-  }
-
-  if (eventId) {
-    await state.markProcessedEvent(eventId);
-  }
-
-  enqueue(chatId, async () => {
-    try {
-      await handleMessage(chatId, payload);
-    } catch (error) {
-      console.error(error);
-      await feishu.sendText(chatId, `处理失败：${formatError(error)}`);
+    if (!feishu.shouldHandleMessage(data, env.groupRequireMention)) {
+      if (messageId) {
+        await state.markProcessedMessage(messageId);
+      }
+      return;
     }
-  });
 
-  res.json({ code: 0 });
+    if (messageId) {
+      await state.markProcessedMessage(messageId);
+    }
+
+    const chatId = feishu.getChatId(data);
+    if (!chatId) {
+      return;
+    }
+
+    enqueue(chatId, async () => {
+      try {
+        await handleMessage(chatId, data);
+      } catch (error) {
+        console.error(error);
+        await feishu.sendText(chatId, `处理失败：${formatError(error)}`);
+      }
+    });
+  },
+  onCardAction: async (event, value) => {
+    const token = typeof event?.token === "string" ? event.token : undefined;
+    if (token && state.hasProcessedActionToken(token)) {
+      return;
+    }
+    if (token) {
+      await state.markProcessedActionToken(token);
+    }
+    await handleCardAction(value);
+  },
 });
 
-app.listen(env.port, () => {
-  console.log(`feishu-opencode-bridge listening on :${env.port}`);
-});
+console.log(`feishu-opencode-bridge started, projects root: ${env.projectsRoot}`);
 
-async function handleMessage(chatId: string, payload: FeishuEventEnvelope): Promise<void> {
-  const text = feishu.extractIncomingText(payload.event!);
+process.once("SIGINT", shutdown);
+process.once("SIGTERM", shutdown);
+
+async function handleMessage(chatId: string, data: any): Promise<void> {
+  const startedAt = Date.now();
+  const text = feishu.extractText(data);
   if (!text) {
     return;
   }
 
-  const commandHandled = await handleCommand(chatId, text);
-  if (commandHandled) {
+  const pendingSelector = state.getPendingSelector(chatId);
+  if (pendingSelector) {
+    const handled = await handleSelectorInput(chatId, text, pendingSelector);
+    if (handled) {
+      return;
+    }
+  }
+
+  if (await handleCommand(chatId, text)) {
     return;
   }
 
-  const project = resolveProject(chatId);
-  if (!project) {
-    await feishu.sendText(chatId, buildProjectsHelp());
+  const binding = state.getBinding(chatId);
+  if (!binding) {
+    await startSelector(chatId, text);
     return;
   }
 
-  const sessionId = await getOrCreateSession(project, chatId);
-  const reply = await opencode.prompt(project, sessionId, text);
+  const sessionId = binding.sessionId ?? await opencode.createSession(binding.directory, `Feishu ${chatId}`);
+  if (!binding.sessionId) {
+    await state.updateBinding(chatId, { sessionId });
+  }
+
+  const reply = await opencode.prompt(binding.directory, sessionId, text);
   await feishu.sendText(chatId, reply);
+  console.log(
+    `[bridge] chat=${chatId} session=${sessionId} duration_ms=${Date.now() - startedAt} text=${JSON.stringify(text.slice(0, 80))}`,
+  );
 }
 
 async function handleCommand(chatId: string, text: string): Promise<boolean> {
   const trimmed = text.trim();
+  const normalized = trimmed.toLowerCase();
 
-  if (trimmed === "/projects") {
-    await feishu.sendText(chatId, buildProjectsHelp());
+  if (trimmed === "/switch") {
+    await state.clearBinding(chatId);
+    await startSelector(chatId);
     return true;
   }
 
   if (trimmed === "/status") {
-    const bound = state.getBinding(chatId) ?? projectConfig.defaultProjectKey ?? "未绑定";
-    await feishu.sendText(chatId, `当前项目：${bound}`);
-    return true;
-  }
-
-  if (trimmed === "/unbind") {
-    await state.clearBinding(chatId);
-    await feishu.sendText(chatId, "已解除当前会话的项目绑定。");
+    const binding = state.getBinding(chatId);
+    if (!binding) {
+      await feishu.sendText(chatId, "当前未绑定项目目录。");
+      return true;
+    }
+    await feishu.sendText(chatId, `当前目录：${binding.directory}`);
     return true;
   }
 
   if (trimmed === "/reset") {
-    const project = resolveProject(chatId);
-    if (!project) {
-      await feishu.sendText(chatId, "当前没有可重置的项目会话。");
+    const binding = state.getBinding(chatId);
+    if (!binding) {
+      await feishu.sendText(chatId, "当前没有可重置的会话。");
       return true;
     }
-    await state.clearSession(project.key, chatId);
-    await feishu.sendText(chatId, `已重置项目 ${project.key} 的会话。`);
+    await state.updateBinding(chatId, { sessionId: undefined });
+    await feishu.sendText(chatId, "已重置当前目录对应的 OpenCode 会话。");
     return true;
   }
 
-  if (!trimmed.startsWith("/bind ")) {
+  if (
+    trimmed === "/next" ||
+    trimmed === "/prev" ||
+    trimmed === "下一页" ||
+    trimmed === "上一页" ||
+    normalized === "next" ||
+    normalized === "prev" ||
+    trimmed.startsWith("/search") ||
+    trimmed.startsWith("/page ")
+  ) {
+    const selector = state.getPendingSelector(chatId) ?? { page: 0, query: "" };
+    if (trimmed === "/next" || trimmed === "下一页" || normalized === "next") {
+      await state.setPendingSelector(chatId, { ...selector, page: selector.page + 1 });
+      await showSelector(chatId);
+      return true;
+    }
+    if (trimmed === "/prev" || trimmed === "上一页" || normalized === "prev") {
+      await state.setPendingSelector(chatId, { ...selector, page: Math.max(0, selector.page - 1) });
+      await showSelector(chatId);
+      return true;
+    }
+    if (trimmed.startsWith("/page ")) {
+      const page = Number(trimmed.slice("/page ".length).trim());
+      if (!Number.isInteger(page) || page <= 0) {
+        await feishu.sendText(chatId, "页码无效。用法：/page 2");
+        return true;
+      }
+      await state.setPendingSelector(chatId, {
+        ...selector,
+        page: page - 1,
+      });
+      await showSelector(chatId);
+      return true;
+    }
+    const query = trimmed.slice("/search".length).trim();
+    await state.setPendingSelector(chatId, {
+      ...selector,
+      page: 0,
+      query,
+    });
+    await showSelector(chatId);
+    return true;
+  }
+
+  return false;
+}
+
+async function handleSelectorInput(chatId: string, text: string, selector: { page: number; query: string; pendingPrompt?: string }): Promise<boolean> {
+  const choice = Number(text.trim());
+  if (!Number.isInteger(choice) || choice <= 0) {
     return false;
   }
 
-  const projectKey = trimmed.slice("/bind ".length).trim();
-  if (!projectConfig.projects.has(projectKey)) {
-    await feishu.sendText(chatId, `未知项目：${projectKey}\n\n${buildProjectsHelp()}`);
+  const projects = await getFilteredProjects(selector.query);
+  const page = Math.max(0, selector.page);
+  const start = page * env.pageSize;
+  const pageItems = projects.slice(start, start + env.pageSize);
+  const selected = pageItems[choice - 1];
+  if (!selected) {
+    await feishu.sendText(chatId, "编号无效，请重新选择。");
+    await showSelector(chatId);
     return true;
   }
 
-  await state.setBinding(chatId, projectKey);
-  await feishu.sendText(chatId, `已绑定到项目 ${projectKey}`);
+  await bindProjectAndReplay(chatId, selected.path, selector.pendingPrompt);
+
   return true;
 }
 
-function resolveProject(chatId: string): ProjectConfig | undefined {
-  const bound = state.getBinding(chatId);
-  if (bound) {
-    return projectConfig.projects.get(bound);
-  }
-
-  if (projectConfig.defaultProjectKey) {
-    return projectConfig.projects.get(projectConfig.defaultProjectKey);
-  }
-
-  return undefined;
+async function startSelector(chatId: string, pendingPrompt?: string): Promise<void> {
+  await state.setPendingSelector(chatId, {
+    page: 0,
+    query: "",
+    pendingPrompt,
+  });
+  await showSelector(chatId);
 }
 
-async function getOrCreateSession(project: ProjectConfig, chatId: string): Promise<string> {
-  const existing = state.getSession(project.key, chatId);
-  if (existing) {
-    return existing;
-  }
-
-  const sessionId = await opencode.createSession(project, `Feishu ${project.key} ${chatId}`);
-  await state.setSession(project.key, chatId, sessionId);
-  return sessionId;
+async function showSelector(chatId: string): Promise<void> {
+  const { options, page, query } = await getSelectorPage(chatId);
+  await feishu.sendProjectSelectorCard(chatId, env.projectsRoot, options, page, env.pageSize, query);
 }
 
-function buildProjectsHelp(): string {
-  const lines = [...projectConfig.projects.values()].map((project) => `- ${project.key}: ${project.name}`);
-  const defaultLine = projectConfig.defaultProjectKey ? `默认项目：${projectConfig.defaultProjectKey}` : "默认项目：未设置";
-  return [
-    defaultLine,
-    "可用命令：",
-    "/projects",
-    "/bind <projectKey>",
-    "/unbind",
-    "/status",
-    "/reset",
-    "",
-    "可用项目：",
-    ...lines,
-  ].join("\n");
+async function getFilteredProjects(query: string) {
+  const projects = await listProjectDirectories(env.projectsRoot);
+  return filterProjectDirectories(projects, query);
+}
+
+async function getSelectorPage(chatId: string): Promise<{ options: Awaited<ReturnType<typeof getFilteredProjects>>; page: number; query: string }> {
+  const selector = state.getPendingSelector(chatId) ?? { page: 0, query: "" };
+  const options = await getFilteredProjects(selector.query);
+  const totalPages = Math.max(1, Math.ceil(options.length / env.pageSize));
+  const page = Math.min(selector.page, totalPages - 1);
+
+  if (page !== selector.page) {
+    await state.updatePendingSelector(chatId, { page });
+  }
+
+  return {
+    options,
+    page,
+    query: selector.query,
+  };
+}
+
+async function handleCardAction(value: CardActionValue): Promise<void> {
+  await withQueue(value.chatId, async () => {
+    if (value.action === "select_project") {
+      const selector = state.getPendingSelector(value.chatId);
+      if (!selector || !value.path) {
+        await startSelector(value.chatId);
+        return;
+      }
+
+      await bindProjectAndReplay(value.chatId, value.path, selector.pendingPrompt);
+      return;
+    }
+
+    const selector = state.getPendingSelector(value.chatId) ?? { page: 0, query: "" };
+    if (value.action === "selector_prev") {
+      await state.setPendingSelector(value.chatId, { ...selector, page: Math.max(0, selector.page - 1) });
+    } else if (value.action === "selector_next") {
+      await state.setPendingSelector(value.chatId, { ...selector, page: selector.page + 1 });
+    } else if (value.action === "selector_refresh") {
+      await state.setPendingSelector(value.chatId, selector);
+    }
+
+    await showSelector(value.chatId);
+  });
+}
+
+async function bindProjectAndReplay(chatId: string, directory: string, pendingPrompt?: string): Promise<void> {
+  await state.setBinding(chatId, {
+    directory,
+  });
+  await state.clearPendingSelector(chatId);
+  await feishu.sendText(chatId, `已绑定项目：${directory}`);
+
+  if (!pendingPrompt) {
+    return;
+  }
+
+  const sessionId = await opencode.createSession(directory, `Feishu ${chatId}`);
+  await state.updateBinding(chatId, { sessionId });
+  const reply = await opencode.prompt(directory, sessionId, pendingPrompt);
+  await feishu.sendText(chatId, reply);
 }
 
 function enqueue(key: string, task: () => Promise<void>): void {
@@ -201,9 +293,46 @@ function enqueue(key: string, task: () => Promise<void>): void {
   queues.set(key, next);
 }
 
+async function withQueue<T>(key: string, task: () => Promise<T>): Promise<T> {
+  const previous = queues.get(key) ?? Promise.resolve();
+  let resolveTask: ((value: T | PromiseLike<T>) => void) | undefined;
+  let rejectTask: ((reason?: unknown) => void) | undefined;
+
+  const result = new Promise<T>((resolve, reject) => {
+    resolveTask = resolve;
+    rejectTask = reject;
+  });
+
+  const next = previous
+    .catch(() => undefined)
+    .then(async () => {
+      const value = await task();
+      resolveTask?.(value);
+      return value;
+    })
+    .catch((error) => {
+      rejectTask?.(error);
+      throw error;
+    })
+    .finally(() => {
+      if (queues.get(key) === next) {
+        queues.delete(key);
+      }
+    });
+
+  queues.set(key, next.then(() => undefined));
+  return await result;
+}
+
 function formatError(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
   }
   return String(error);
+}
+
+function shutdown(): void {
+  feishu.close();
+  opencode.close();
+  process.exit(0);
 }

@@ -1,11 +1,12 @@
 import path from "node:path";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import type { StateData } from "./types.js";
+import type { ChatBinding, PendingSelector, StateData } from "./types.js";
 
 const EMPTY_STATE: StateData = {
   bindings: {},
-  sessions: {},
-  processedEventIds: [],
+  pendingSelectors: {},
+  processedMessageIds: [],
+  processedActionTokens: [],
 };
 
 export class StateStore {
@@ -20,8 +21,9 @@ export class StateStore {
       const parsed = JSON.parse(raw) as Partial<StateData>;
       this.state = {
         bindings: parsed.bindings ?? {},
-        sessions: parsed.sessions ?? {},
-        processedEventIds: parsed.processedEventIds ?? [],
+        pendingSelectors: parsed.pendingSelectors ?? {},
+        processedMessageIds: parsed.processedMessageIds ?? [],
+        processedActionTokens: parsed.processedActionTokens ?? [],
       };
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
@@ -32,12 +34,24 @@ export class StateStore {
     }
   }
 
-  getBinding(chatId: string): string | undefined {
+  getBinding(chatId: string): ChatBinding | undefined {
     return this.state.bindings[chatId];
   }
 
-  async setBinding(chatId: string, projectKey: string): Promise<void> {
-    this.state.bindings[chatId] = projectKey;
+  async setBinding(chatId: string, binding: ChatBinding): Promise<void> {
+    this.state.bindings[chatId] = binding;
+    await this.flush();
+  }
+
+  async updateBinding(chatId: string, patch: Partial<ChatBinding>): Promise<void> {
+    const current = this.state.bindings[chatId];
+    if (!current) {
+      return;
+    }
+    this.state.bindings[chatId] = {
+      ...current,
+      ...patch,
+    };
     await this.flush();
   }
 
@@ -46,34 +60,54 @@ export class StateStore {
     await this.flush();
   }
 
-  getSession(projectKey: string, chatId: string): string | undefined {
-    return this.state.sessions[this.sessionKey(projectKey, chatId)];
+  getPendingSelector(chatId: string): PendingSelector | undefined {
+    return this.state.pendingSelectors[chatId];
   }
 
-  async setSession(projectKey: string, chatId: string, sessionId: string): Promise<void> {
-    this.state.sessions[this.sessionKey(projectKey, chatId)] = sessionId;
+  async setPendingSelector(chatId: string, selector: PendingSelector): Promise<void> {
+    this.state.pendingSelectors[chatId] = selector;
     await this.flush();
   }
 
-  async clearSession(projectKey: string, chatId: string): Promise<void> {
-    delete this.state.sessions[this.sessionKey(projectKey, chatId)];
+  async updatePendingSelector(chatId: string, patch: Partial<PendingSelector>): Promise<void> {
+    const current = this.state.pendingSelectors[chatId];
+    if (!current) {
+      return;
+    }
+    this.state.pendingSelectors[chatId] = {
+      ...current,
+      ...patch,
+    };
     await this.flush();
   }
 
-  hasProcessedEvent(eventId: string): boolean {
-    return this.state.processedEventIds.includes(eventId);
+  async clearPendingSelector(chatId: string): Promise<void> {
+    delete this.state.pendingSelectors[chatId];
+    await this.flush();
   }
 
-  async markProcessedEvent(eventId: string): Promise<void> {
-    this.state.processedEventIds.push(eventId);
-    if (this.state.processedEventIds.length > 5000) {
-      this.state.processedEventIds = this.state.processedEventIds.slice(-2500);
+  hasProcessedMessage(messageId: string): boolean {
+    return this.state.processedMessageIds.includes(messageId);
+  }
+
+  async markProcessedMessage(messageId: string): Promise<void> {
+    this.state.processedMessageIds.push(messageId);
+    if (this.state.processedMessageIds.length > 5000) {
+      this.state.processedMessageIds = this.state.processedMessageIds.slice(-2500);
     }
     await this.flush();
   }
 
-  private sessionKey(projectKey: string, chatId: string): string {
-    return `${projectKey}:${chatId}`;
+  hasProcessedActionToken(token: string): boolean {
+    return this.state.processedActionTokens.includes(token);
+  }
+
+  async markProcessedActionToken(token: string): Promise<void> {
+    this.state.processedActionTokens.push(token);
+    if (this.state.processedActionTokens.length > 5000) {
+      this.state.processedActionTokens = this.state.processedActionTokens.slice(-2500);
+    }
+    await this.flush();
   }
 
   private async flush(): Promise<void> {

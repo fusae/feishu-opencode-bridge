@@ -1,11 +1,14 @@
-import { createOpencodeClient, type OpencodeClient } from "@opencode-ai/sdk";
-import type { ProjectConfig } from "./types.js";
+import { createOpencodeClient, createOpencodeServer, type OpencodeClient } from "@opencode-ai/sdk";
+import type { BridgeEnv } from "./types.js";
+
+const POLL_INTERVAL_MS = 1500;
+const POLL_TIMEOUT_MS = 10 * 60_000;
 
 function toBasicAuth(username: string, password: string): string {
   return `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`;
 }
 
-function collectText(parts: Array<{ type: string; text?: string }>): string {
+function extractText(parts: Array<{ type: string; text?: string }>): string {
   return parts
     .filter((part) => part.type === "text" && typeof part.text === "string")
     .map((part) => part.text!.trim())
@@ -14,49 +17,60 @@ function collectText(parts: Array<{ type: string; text?: string }>): string {
     .trim();
 }
 
-export class OpencodeRegistry {
+export class OpencodeDaemon {
+  private serverUrl?: string;
+  private serverCloser?: { close(): void };
   private readonly clients = new Map<string, OpencodeClient>();
 
-  getClient(project: ProjectConfig): OpencodeClient {
-    const existing = this.clients.get(project.key);
-    if (existing) {
-      return existing;
-    }
+  constructor(private readonly env: BridgeEnv) {}
 
-    const headers: Record<string, string> = {};
-    if (project.password) {
-      headers.authorization = toBasicAuth(project.username || "opencode", project.password);
+  async start(): Promise<void> {
+    if (this.serverCloser) {
+      return;
     }
-
-    const client = createOpencodeClient({
-      baseUrl: project.baseUrl,
-      headers,
-      directory: project.directory,
+    const started = await createOpencodeServer({
+      hostname: this.env.opencodeServerHostname,
+      port: this.env.opencodeServerPort,
+      timeout: 15_000,
     });
-
-    this.clients.set(project.key, client);
-    return client;
+    this.serverUrl = started.url;
+    this.serverCloser = started;
   }
 
-  async createSession(project: ProjectConfig, title: string): Promise<string> {
-    const client = this.getClient(project);
+  close(): void {
+    this.serverCloser?.close();
+  }
+
+  async createSession(directory: string, title: string): Promise<string> {
+    const client = this.getClient(directory);
     const result = await client.session.create({
       body: { title },
     });
-
     if (!result.data) {
       throw new Error("failed to create opencode session");
     }
-
     return result.data.id;
   }
 
-  async prompt(project: ProjectConfig, sessionId: string, text: string): Promise<string> {
-    const client = this.getClient(project);
-    const result = await client.session.prompt({
+  async prompt(directory: string, sessionId: string, text: string): Promise<string> {
+    const client = this.getClient(directory);
+    const beforeMessages = await client.session.messages({
+      path: { id: sessionId },
+    });
+    if (beforeMessages.error) {
+      throw new Error(JSON.stringify(beforeMessages.error));
+    }
+
+    const seenAssistantIds = new Set(
+      (beforeMessages.data ?? [])
+        .filter((item) => item.info.role === "assistant")
+        .map((item) => item.info.id),
+    );
+
+    const accepted = await client.session.promptAsync({
       path: { id: sessionId },
       body: {
-        system: project.systemPrompt,
+        system: this.env.opencodeSystemPrompt,
         parts: [
           {
             type: "text",
@@ -65,17 +79,76 @@ export class OpencodeRegistry {
         ],
       },
     });
-
-    if (result.error) {
-      throw new Error(JSON.stringify(result.error));
+    if (accepted.error) {
+      throw new Error(JSON.stringify(accepted.error));
     }
 
-    const parts = result.data?.parts ?? [];
-    const reply = collectText(parts);
-    if (!reply) {
-      throw new Error("opencode returned empty text response");
+    const deadline = Date.now() + POLL_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await sleep(POLL_INTERVAL_MS);
+
+      const messages = await client.session.messages({
+        path: { id: sessionId },
+      });
+      if (messages.error) {
+        throw new Error(JSON.stringify(messages.error));
+      }
+
+      const latestAssistant = [...(messages.data ?? [])]
+        .reverse()
+        .find((item) => item.info.role === "assistant" && !seenAssistantIds.has(item.info.id));
+
+      if (!latestAssistant) {
+        continue;
+      }
+
+      const assistantInfo = latestAssistant.info;
+      if (assistantInfo.role !== "assistant") {
+        continue;
+      }
+
+      if (assistantInfo.error) {
+        throw new Error(JSON.stringify(assistantInfo.error));
+      }
+
+      if (!assistantInfo.time.completed) {
+        continue;
+      }
+
+      const reply = extractText(latestAssistant.parts ?? []);
+      if (!reply) {
+        throw new Error("opencode returned empty text response");
+      }
+      return reply;
     }
 
-    return reply;
+    throw new Error("opencode response timeout");
   }
+
+  private getClient(directory: string): OpencodeClient {
+    const existing = this.clients.get(directory);
+    if (existing) {
+      return existing;
+    }
+    if (!this.serverUrl) {
+      throw new Error("opencode server is not started");
+    }
+
+    const headers: Record<string, string> = {};
+    if (this.env.opencodeServerPassword) {
+      headers.authorization = toBasicAuth(this.env.opencodeServerUsername, this.env.opencodeServerPassword);
+    }
+
+    const client = createOpencodeClient({
+      baseUrl: this.serverUrl,
+      headers,
+      directory,
+    });
+    this.clients.set(directory, client);
+    return client;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
