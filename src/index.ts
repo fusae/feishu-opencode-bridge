@@ -1,6 +1,7 @@
 import process from "node:process";
 import { loadEnv } from "./config.js";
 import { FeishuBridgeClient } from "./feishu.js";
+import { logError, logLine } from "./logger.js";
 import { OpencodeDaemon } from "./opencode.js";
 import { filterProjectDirectories, listProjectDirectories } from "./projects.js";
 import { StateStore } from "./state.js";
@@ -70,6 +71,7 @@ async function handleMessage(chatId: string, data: any): Promise<void> {
   if (!text) {
     return;
   }
+  await logLine(`[message] recv chat=${chatId} text=${JSON.stringify(text.slice(0, 120))}`);
 
   const pendingSelector = state.getPendingSelector(chatId);
   if (pendingSelector) {
@@ -111,6 +113,7 @@ async function handleMessage(chatId: string, data: any): Promise<void> {
   console.log(
     `[bridge] chat=${chatId} session=${sessionId} duration_ms=${Date.now() - startedAt} text=${JSON.stringify(text.slice(0, 80))}`,
   );
+  await logLine(`[message] done chat=${chatId} session=${sessionId} duration_ms=${Date.now() - startedAt}`);
 }
 
 async function handleCommand(chatId: string, text: string): Promise<boolean> {
@@ -297,6 +300,7 @@ async function bindProjectAndReplay(chatId: string, directory: string, pendingPr
 async function deliverPromptResult(chatId: string, sessionId: string, result: Awaited<ReturnType<OpencodeDaemon["prompt"]>>): Promise<void> {
   if (result.type === "reply") {
     await feishu.sendText(chatId, result.text);
+    await logLine(`[reply] sent chat=${chatId} session=${sessionId} chars=${result.text.length}`);
     return;
   }
 
@@ -305,6 +309,7 @@ async function deliverPromptResult(chatId: string, sessionId: string, result: Aw
     questions: result.questions,
   });
   await feishu.sendText(chatId, formatQuestions(result.questions));
+  await logLine(`[question] sent chat=${chatId} session=${sessionId} count=${result.questions.length}`);
 }
 
 function enqueue(key: string, task: () => Promise<void>): void {
@@ -384,3 +389,11 @@ function shutdown(): void {
   opencode.close();
   process.exit(0);
 }
+
+process.on("unhandledRejection", (error) => {
+  void logError("unhandledRejection", error);
+});
+
+process.on("uncaughtException", (error) => {
+  void logError("uncaughtException", error).finally(() => process.exit(1));
+});

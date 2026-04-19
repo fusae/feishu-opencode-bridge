@@ -1,4 +1,5 @@
 import * as Lark from "@larksuiteoapi/node-sdk";
+import { logError, logLine } from "./logger.js";
 import type { BridgeEnv, CardActionValue, DirectoryOption } from "./types.js";
 
 function normalizeText(value: string | undefined): string | undefined {
@@ -22,7 +23,12 @@ function splitText(text: string, size = 3800): string[] {
 
 export class FeishuBridgeClient {
   readonly client: Lark.Client;
-  readonly wsClient: Lark.WSClient;
+  private wsClient?: Lark.WSClient;
+  private eventDispatcher?: Lark.EventDispatcher;
+  private recycleTimer?: NodeJS.Timeout;
+  private isRestarting = false;
+
+  private static readonly WS_RECYCLE_INTERVAL_MS = 15 * 60_000;
 
   constructor(private readonly env: BridgeEnv) {
     const domain = env.feishuDomain === "Lark" ? Lark.Domain.Lark : Lark.Domain.Feishu;
@@ -32,25 +38,22 @@ export class FeishuBridgeClient {
       domain,
     };
     this.client = new Lark.Client(baseConfig);
-    this.wsClient = new Lark.WSClient({
-      ...baseConfig,
-      loggerLevel: Lark.LoggerLevel.info,
-    });
   }
 
   async start(params: {
     onMessage: (data: any) => Promise<void>;
     onCardAction: (event: any, value: CardActionValue) => Promise<void>;
   }): Promise<void> {
-    await this.wsClient.start({
-      eventDispatcher: new Lark.EventDispatcher({
-        verificationToken: this.env.feishuVerificationToken,
-        encryptKey: this.env.feishuEncryptKey,
-      }).register({
+    this.eventDispatcher = new Lark.EventDispatcher({
+      verificationToken: this.env.feishuVerificationToken,
+      encryptKey: this.env.feishuEncryptKey,
+    }).register({
         "im.message.receive_v1": async (data: unknown) => {
+          await logLine(`[ws] inbound type=im.message.receive_v1 messageId=${this.getMessageId(data as any) ?? ""}`);
           void params.onMessage(data);
         },
         "card.action.trigger": async (event: unknown) => {
+          await logLine(`[ws] inbound type=card.action.trigger token=${typeof (event as any)?.token === "string" ? (event as any).token : ""}`);
           const value = parseCardActionValue((event as any)?.action?.value);
           if (!value) {
             return;
@@ -67,12 +70,19 @@ export class FeishuBridgeClient {
             }
           }
         }
-      }),
-    });
+      });
+
+    await this.startWebSocket("initial");
+    this.scheduleWebSocketRecycle();
   }
 
   close(): void {
-    this.wsClient.close({ force: true });
+    if (this.recycleTimer) {
+      clearInterval(this.recycleTimer);
+      this.recycleTimer = undefined;
+    }
+    this.wsClient?.close({ force: true });
+    this.wsClient = undefined;
   }
 
   getMessageId(data: any): string | undefined {
@@ -121,30 +131,18 @@ export class FeishuBridgeClient {
 
   async sendText(chatId: string, text: string): Promise<void> {
     for (const chunk of splitText(text)) {
-      await this.client.im.v1.message.create({
-        params: {
-          receive_id_type: "chat_id",
-        },
-        data: {
-          receive_id: chatId,
-          content: JSON.stringify({ text: chunk }),
-          msg_type: "text",
-        },
+      await this.sendMessageWithRetry(chatId, {
+        content: JSON.stringify({ text: chunk }),
+        msg_type: "text",
       });
     }
   }
 
   async sendProjectSelectorCard(chatId: string, root: string, options: DirectoryOption[], page: number, pageSize: number, query: string): Promise<void> {
     const card = this.buildProjectSelectorCard(chatId, root, options, page, pageSize, query);
-    await this.client.im.v1.message.create({
-      params: {
-        receive_id_type: "chat_id",
-      },
-      data: {
-        receive_id: chatId,
-        content: JSON.stringify(card),
-        msg_type: "interactive",
-      },
+    await this.sendMessageWithRetry(chatId, {
+      content: JSON.stringify(card),
+      msg_type: "interactive",
     });
   }
 
@@ -271,6 +269,88 @@ export class FeishuBridgeClient {
       elements,
     };
   }
+
+  private async sendMessageWithRetry(chatId: string, payload: { content: string; msg_type: "text" | "interactive" }): Promise<void> {
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        await this.client.im.v1.message.create({
+          params: {
+            receive_id_type: "chat_id",
+          },
+          data: {
+            receive_id: chatId,
+            content: payload.content,
+            msg_type: payload.msg_type,
+          },
+        });
+        await logLine(`[send] ok type=${payload.msg_type} chat=${chatId} attempt=${attempt}`);
+        return;
+      } catch (error) {
+        lastError = error;
+        await logError("feishu.sendMessage", error, {
+          chatId,
+          attempt,
+          msgType: payload.msg_type,
+        });
+        if (attempt < 3) {
+          await sleep(attempt * 500);
+        }
+      }
+    }
+
+    throw lastError;
+  }
+
+  private async startWebSocket(reason: string): Promise<void> {
+    if (!this.eventDispatcher) {
+      throw new Error("event dispatcher is not ready");
+    }
+
+    const domain = this.env.feishuDomain === "Lark" ? Lark.Domain.Lark : Lark.Domain.Feishu;
+    this.wsClient = new Lark.WSClient({
+      appId: this.env.feishuAppId,
+      appSecret: this.env.feishuAppSecret,
+      domain,
+      loggerLevel: Lark.LoggerLevel.info,
+      autoReconnect: true,
+    });
+
+    await logLine(`[ws] start reason=${reason}`);
+    await this.wsClient.start({
+      eventDispatcher: this.eventDispatcher,
+    });
+  }
+
+  private scheduleWebSocketRecycle(): void {
+    if (this.recycleTimer) {
+      clearInterval(this.recycleTimer);
+    }
+
+    this.recycleTimer = setInterval(() => {
+      void this.restartWebSocket("scheduled_recycle");
+    }, FeishuBridgeClient.WS_RECYCLE_INTERVAL_MS);
+  }
+
+  private async restartWebSocket(reason: string): Promise<void> {
+    if (this.isRestarting) {
+      return;
+    }
+    this.isRestarting = true;
+
+    try {
+      await logLine(`[ws] restart reason=${reason}`);
+      this.wsClient?.close({ force: true });
+      this.wsClient = undefined;
+      await sleep(300);
+      await this.startWebSocket(reason);
+    } catch (error) {
+      await logError("feishu.restartWebSocket", error, { reason });
+    } finally {
+      this.isRestarting = false;
+    }
+  }
 }
 
 function parseCardActionValue(value: unknown): CardActionValue | null {
@@ -308,4 +388,8 @@ function formatError(error: unknown): string {
     return error.message;
   }
   return String(error);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
