@@ -23,30 +23,50 @@ await feishu.start({
     if (messageId && state.hasProcessedMessage(messageId)) {
       return;
     }
-    if (!feishu.shouldHandleMessage(data, env.groupRequireMention)) {
+
+    const verdict = feishu.shouldHandleMessage(data, env.groupRequireMention);
+    if (verdict === "skip") {
       if (messageId) {
         await state.markProcessedMessage(messageId);
       }
       return;
     }
 
-    if (messageId) {
-      await state.markProcessedMessage(messageId);
-    }
-
     const chatId = feishu.getChatId(data);
     if (!chatId) {
+      await logLine(`[message] drop reason=no_chat_id messageId=${messageId ?? ""}`);
+      if (messageId) {
+        await state.markProcessedMessage(messageId);
+      }
       return;
     }
 
+    if (verdict === "unsupported") {
+      if (messageId) {
+        await state.markProcessedMessage(messageId);
+      }
+      const msgType = feishu.getMessageType(data) ?? "unknown";
+      await feishu.sendText(chatId, `暂不支持 ${msgType} 类型的消息，请发送文本消息。`);
+      return;
+    }
+
+    await logLine(`[message] enqueue chat=${chatId} messageId=${messageId ?? ""}`);
     enqueue(chatId, async () => {
       try {
+        await logLine(`[message] dequeue chat=${chatId} messageId=${messageId ?? ""}`);
         await handleMessage(chatId, data);
+        if (messageId) {
+          await state.markProcessedMessage(messageId);
+        }
       } catch (error) {
         console.error(error);
+        await logError("handleMessage", error, { chatId, messageId });
         await feishu.sendText(chatId, `处理失败：${formatError(error)}`);
       }
     });
+  },
+  onUnsupportedMessage: async (chatId, messageType) => {
+    await feishu.sendText(chatId, `暂不支持 ${messageType} 类型的消息，请发送文本消息。`);
   },
   onCardAction: async (event, value) => {
     const token = typeof event?.token === "string" ? event.token : undefined;
@@ -88,13 +108,18 @@ async function handleMessage(chatId: string, data: any): Promise<void> {
   const binding = state.getBinding(chatId);
   const pendingQuestion = state.getPendingQuestion(chatId);
   if (binding && pendingQuestion) {
-    await state.clearPendingQuestion(chatId);
-    const result = await opencode.prompt(
-      binding.directory,
-      pendingQuestion.sessionId,
-      buildQuestionAnswerPrompt(pendingQuestion.questions, text),
-    );
-    await deliverPromptResult(chatId, pendingQuestion.sessionId, result);
+    try {
+      const result = await opencode.prompt(
+        binding.directory,
+        pendingQuestion.sessionId,
+        buildQuestionAnswerPrompt(pendingQuestion.questions, text),
+      );
+      await state.clearPendingQuestion(chatId);
+      await deliverPromptResult(chatId, pendingQuestion.sessionId, result);
+    } catch (error) {
+      await logError("handleMessage.pendingQuestion", error, { chatId });
+      throw error;
+    }
     return;
   }
 
@@ -156,12 +181,16 @@ async function handleCommand(chatId: string, text: string): Promise<boolean> {
     trimmed === "上一页" ||
     normalized === "next" ||
     normalized === "prev" ||
-    trimmed.startsWith("/search") ||
+    trimmed === "/search" ||
+    trimmed.startsWith("/search ") ||
     trimmed.startsWith("/page ")
   ) {
     const selector = state.getPendingSelector(chatId) ?? { page: 0, query: "" };
     if (trimmed === "/next" || trimmed === "下一页" || normalized === "next") {
-      await state.setPendingSelector(chatId, { ...selector, page: selector.page + 1 });
+      const projects = await getFilteredProjects(selector.query);
+      const totalPages = Math.max(1, Math.ceil(projects.length / env.pageSize));
+      const nextPage = Math.min(selector.page + 1, totalPages - 1);
+      await state.setPendingSelector(chatId, { ...selector, page: nextPage });
       await showSelector(chatId);
       return true;
     }
@@ -271,7 +300,10 @@ async function handleCardAction(value: CardActionValue): Promise<void> {
     if (value.action === "selector_prev") {
       await state.setPendingSelector(value.chatId, { ...selector, page: Math.max(0, selector.page - 1) });
     } else if (value.action === "selector_next") {
-      await state.setPendingSelector(value.chatId, { ...selector, page: selector.page + 1 });
+      const projects = await getFilteredProjects(selector.query);
+      const totalPages = Math.max(1, Math.ceil(projects.length / env.pageSize));
+      const nextPage = Math.min(selector.page + 1, totalPages - 1);
+      await state.setPendingSelector(value.chatId, { ...selector, page: nextPage });
     } else if (value.action === "selector_refresh") {
       await state.setPendingSelector(value.chatId, selector);
     }
@@ -315,7 +347,9 @@ async function deliverPromptResult(chatId: string, sessionId: string, result: Aw
 function enqueue(key: string, task: () => Promise<void>): void {
   const previous = queues.get(key) ?? Promise.resolve();
   const next = previous
-    .catch(() => undefined)
+    .catch((error) => {
+      void logError("enqueue.previous", error, { key });
+    })
     .then(task)
     .finally(() => {
       if (queues.get(key) === next) {
@@ -387,7 +421,24 @@ function formatQuestions(questions: string[]): string {
 function shutdown(): void {
   feishu.close();
   opencode.close();
-  process.exit(0);
+
+  const pending = Array.from(queues.values());
+  if (pending.length === 0) {
+    process.exit(0);
+    return;
+  }
+
+  const SHUTDOWN_TIMEOUT_MS = 10_000;
+  void logLine(`[shutdown] waiting for ${pending.length} pending queue(s)`);
+  const timer = setTimeout(() => {
+    void logLine("[shutdown] timeout, forcing exit");
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS);
+
+  Promise.allSettled(pending).then(() => {
+    clearTimeout(timer);
+    process.exit(0);
+  });
 }
 
 process.on("unhandledRejection", (error) => {

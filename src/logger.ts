@@ -4,8 +4,10 @@ import path from "node:path";
 const LOG_DIR = path.resolve(process.cwd(), "logs");
 const LOG_FILE = path.join(LOG_DIR, "bridge.log");
 
+const logDirReady = mkdir(LOG_DIR, { recursive: true });
+
 export async function logLine(message: string): Promise<void> {
-  await mkdir(LOG_DIR, { recursive: true });
+  await logDirReady;
   await appendFile(LOG_FILE, `${new Date().toISOString()} ${message}\n`, "utf8");
 }
 

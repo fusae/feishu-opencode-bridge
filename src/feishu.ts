@@ -2,6 +2,8 @@ import * as Lark from "@larksuiteoapi/node-sdk";
 import { logError, logLine } from "./logger.js";
 import type { BridgeEnv, CardActionValue, DirectoryOption } from "./types.js";
 
+const FEISHU_HTTP_TIMEOUT_MS = 30_000;
+
 function normalizeText(value: string | undefined): string | undefined {
   if (!value) {
     return undefined;
@@ -10,19 +12,83 @@ function normalizeText(value: string | undefined): string | undefined {
   return cleaned || undefined;
 }
 
+function extractPostText(content: unknown): string | undefined {
+  if (!content || typeof content !== "object") {
+    return undefined;
+  }
+
+  const root = content as Record<string, unknown>;
+  const locale =
+    (root.zh_cn as Record<string, unknown> | undefined) ??
+    (root.en_us as Record<string, unknown> | undefined) ??
+    root;
+  const blocks = Array.isArray(locale.content) ? locale.content : [];
+  const paragraphs = blocks
+    .map((block) => {
+      if (!Array.isArray(block)) {
+        return "";
+      }
+      return block
+        .map((item) => {
+          if (!item || typeof item !== "object") {
+            return "";
+          }
+          const record = item as Record<string, unknown>;
+          if (record.tag === "text" && typeof record.text === "string") {
+            return record.text;
+          }
+          if (record.tag === "a" && typeof record.text === "string") {
+            return record.text;
+          }
+          if (record.tag === "at" && typeof record.user_name === "string") {
+            return `@${record.user_name}`;
+          }
+          return "";
+        })
+        .join("")
+        .trim();
+    })
+    .filter(Boolean);
+
+  const title = typeof locale.title === "string" ? locale.title.trim() : "";
+  const merged = [title, ...paragraphs].filter(Boolean).join("\n");
+  return normalizeText(merged);
+}
+
 function splitText(text: string, size = 3800): string[] {
-  if (text.length <= size) {
+  const chars = Array.from(text);
+  if (chars.length <= size) {
     return [text];
   }
   const chunks: string[] = [];
-  for (let index = 0; index < text.length; index += size) {
-    chunks.push(text.slice(index, index + size));
+  for (let index = 0; index < chars.length; index += size) {
+    chunks.push(chars.slice(index, index + size).join(""));
   }
   return chunks;
 }
 
+function createTimeoutHttpInstance(defaultTimeoutMs: number): Lark.HttpInstance {
+  const base = Lark.defaultHttpInstance as unknown as Lark.HttpInstance;
+
+  function injectTimeout<D>(opts?: Lark.HttpRequestOptions<D>): Lark.HttpRequestOptions<D> {
+    return { timeout: defaultTimeoutMs, ...opts } as Lark.HttpRequestOptions<D>;
+  }
+
+  return {
+    request: (opts) => base.request(injectTimeout(opts)),
+    get: (url, opts) => base.get(url, injectTimeout(opts)),
+    post: (url, data, opts) => base.post(url, data, injectTimeout(opts)),
+    put: (url, data, opts) => base.put(url, data, injectTimeout(opts)),
+    patch: (url, data, opts) => base.patch(url, data, injectTimeout(opts)),
+    delete: (url, opts) => base.delete(url, injectTimeout(opts)),
+    head: (url, opts) => base.head(url, injectTimeout(opts)),
+    options: (url, opts) => base.options(url, injectTimeout(opts)),
+  };
+}
+
 export class FeishuBridgeClient {
   readonly client: Lark.Client;
+  private botOpenId?: string;
   private wsClient?: Lark.WSClient;
   private eventDispatcher?: Lark.EventDispatcher;
   private recycleTimer?: NodeJS.Timeout;
@@ -36,21 +102,43 @@ export class FeishuBridgeClient {
       appId: env.feishuAppId,
       appSecret: env.feishuAppSecret,
       domain,
+      httpInstance: createTimeoutHttpInstance(FEISHU_HTTP_TIMEOUT_MS),
     };
     this.client = new Lark.Client(baseConfig);
   }
 
+  private async fetchBotOpenId(): Promise<void> {
+    try {
+      const resp: any = await this.client.request({
+        method: "GET",
+        url: "/open-apis/bot/v3/info/",
+      });
+      const openId = resp?.bot?.open_id;
+      if (typeof openId === "string" && openId) {
+        this.botOpenId = openId;
+        await logLine(`[bot] fetched bot open_id=${openId}`);
+      }
+    } catch (error) {
+      await logError("feishu.fetchBotOpenId", error);
+    }
+  }
+
   async start(params: {
     onMessage: (data: any) => Promise<void>;
+    onUnsupportedMessage: (chatId: string, messageType: string) => Promise<void>;
     onCardAction: (event: any, value: CardActionValue) => Promise<void>;
   }): Promise<void> {
+    await this.fetchBotOpenId();
+
     this.eventDispatcher = new Lark.EventDispatcher({
       verificationToken: this.env.feishuVerificationToken,
       encryptKey: this.env.feishuEncryptKey,
     }).register({
         "im.message.receive_v1": async (data: unknown) => {
-          await logLine(`[ws] inbound type=im.message.receive_v1 messageId=${this.getMessageId(data as any) ?? ""}`);
-          void params.onMessage(data);
+          await logLine(
+            `[ws] inbound type=im.message.receive_v1 messageId=${this.getMessageId(data as any) ?? ""} messageType=${this.getMessageType(data as any) ?? ""} chatType=${this.getChatType(data as any) ?? ""}`,
+          );
+          await params.onMessage(data);
         },
         "card.action.trigger": async (event: unknown) => {
           await logLine(`[ws] inbound type=card.action.trigger token=${typeof (event as any)?.token === "string" ? (event as any).token : ""}`);
@@ -101,28 +189,43 @@ export class FeishuBridgeClient {
     return data?.message?.message_type;
   }
 
-  shouldHandleMessage(data: any, requireMentionInGroup: boolean): boolean {
+  shouldHandleMessage(data: any, requireMentionInGroup: boolean): "handle" | "unsupported" | "skip" {
     const chatId = this.getChatId(data);
     const messageId = this.getMessageId(data);
     if (!chatId || !messageId) {
-      return false;
+      return "skip";
     }
-    if (this.getMessageType(data) !== "text") {
-      return false;
+    const messageType = this.getMessageType(data);
+    const isGroup = this.getChatType(data) === "group";
+
+    if (isGroup && requireMentionInGroup) {
+      const mentions = Array.isArray(data?.message?.mentions) ? data.message.mentions : [];
+      const mentionsBot = this.botOpenId
+        ? mentions.some((m: any) => m?.id?.open_id === this.botOpenId || m?.id === this.botOpenId)
+        : mentions.length > 0;
+      if (!mentionsBot) {
+        return "skip";
+      }
     }
-    if (this.getChatType(data) !== "group" || !requireMentionInGroup) {
-      return true;
+
+    if (messageType !== "text" && messageType !== "post") {
+      return isGroup ? "skip" : "unsupported";
     }
-    return Array.isArray(data?.message?.mentions) && data.message.mentions.length > 0;
+
+    return "handle";
   }
 
   extractText(data: any): string | undefined {
+    const messageType = this.getMessageType(data);
     const content = data?.message?.content;
     if (!content) {
       return undefined;
     }
     try {
       const parsed = JSON.parse(content) as { text?: string };
+      if (messageType === "post") {
+        return extractPostText(parsed);
+      }
       return normalizeText(parsed.text);
     } catch {
       return normalizeText(content);
@@ -339,14 +442,18 @@ export class FeishuBridgeClient {
     }
     this.isRestarting = true;
 
+    const oldClient = this.wsClient;
     try {
       await logLine(`[ws] restart reason=${reason}`);
-      this.wsClient?.close({ force: true });
       this.wsClient = undefined;
-      await sleep(300);
       await this.startWebSocket(reason);
+      await sleep(300);
+      oldClient?.close({ force: true });
     } catch (error) {
       await logError("feishu.restartWebSocket", error, { reason });
+      if (!this.wsClient && oldClient) {
+        this.wsClient = oldClient;
+      }
     } finally {
       this.isRestarting = false;
     }

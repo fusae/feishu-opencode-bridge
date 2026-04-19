@@ -1,4 +1,5 @@
 import { createOpencodeClient, createOpencodeServer, type OpencodeClient, type Part } from "@opencode-ai/sdk";
+import { logError, logLine } from "./logger.js";
 import type { BridgeEnv } from "./types.js";
 
 const POLL_INTERVAL_MS = 1500;
@@ -50,10 +51,12 @@ export type PromptResult =
       questions: string[];
     };
 
+const MAX_CLIENTS = 50;
+
 export class OpencodeDaemon {
   private serverUrl?: string;
   private serverCloser?: { close(): void };
-  private readonly clients = new Map<string, OpencodeClient>();
+  private readonly clients = new Map<string, { client: OpencodeClient; lastUsed: number }>();
 
   constructor(private readonly env: BridgeEnv) {}
 
@@ -61,13 +64,30 @@ export class OpencodeDaemon {
     if (this.serverCloser) {
       return;
     }
-    const started = await createOpencodeServer({
-      hostname: this.env.opencodeServerHostname,
-      port: this.env.opencodeServerPort,
-      timeout: 15_000,
-    });
-    this.serverUrl = started.url;
-    this.serverCloser = started;
+
+    const MAX_RETRIES = 3;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt += 1) {
+      try {
+        const started = await createOpencodeServer({
+          hostname: this.env.opencodeServerHostname,
+          port: this.env.opencodeServerPort,
+          timeout: 15_000,
+        });
+        this.serverUrl = started.url;
+        this.serverCloser = started;
+        await logLine(`[opencode] server started url=${started.url} attempt=${attempt}`);
+        return;
+      } catch (error) {
+        lastError = error;
+        await logError("opencode.start", error, { attempt });
+        if (attempt < MAX_RETRIES) {
+          await sleep(attempt * 1000);
+        }
+      }
+    }
+
+    throw new Error(`Failed to start opencode server after ${MAX_RETRIES} attempts: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
   }
 
   close(): void {
@@ -116,16 +136,36 @@ export class OpencodeDaemon {
       throw new Error(JSON.stringify(accepted.error));
     }
 
+    const MAX_CONSECUTIVE_ERRORS = 3;
+    let consecutiveErrors = 0;
     const deadline = Date.now() + POLL_TIMEOUT_MS;
     while (Date.now() < deadline) {
       await sleep(POLL_INTERVAL_MS);
 
-      const messages = await client.session.messages({
-        path: { id: sessionId },
-      });
-      if (messages.error) {
-        throw new Error(JSON.stringify(messages.error));
+      let messages: Awaited<ReturnType<typeof client.session.messages>>;
+      try {
+        messages = await client.session.messages({
+          path: { id: sessionId },
+        });
+      } catch (error) {
+        consecutiveErrors += 1;
+        await logError("opencode.prompt.poll", error, { sessionId, consecutiveErrors });
+        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          throw error;
+        }
+        continue;
       }
+
+      if ("error" in messages && messages.error) {
+        consecutiveErrors += 1;
+        await logError("opencode.prompt.poll", messages.error, { sessionId, consecutiveErrors });
+        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          throw new Error(JSON.stringify(messages.error));
+        }
+        continue;
+      }
+
+      consecutiveErrors = 0;
 
       const latestAssistant = [...(messages.data ?? [])]
         .reverse()
@@ -183,10 +223,25 @@ export class OpencodeDaemon {
   private getClient(directory: string): OpencodeClient {
     const existing = this.clients.get(directory);
     if (existing) {
-      return existing;
+      existing.lastUsed = Date.now();
+      return existing.client;
     }
     if (!this.serverUrl) {
       throw new Error("opencode server is not started");
+    }
+
+    if (this.clients.size >= MAX_CLIENTS) {
+      let oldestKey: string | undefined;
+      let oldestTime = Infinity;
+      for (const [key, entry] of this.clients) {
+        if (entry.lastUsed < oldestTime) {
+          oldestTime = entry.lastUsed;
+          oldestKey = key;
+        }
+      }
+      if (oldestKey) {
+        this.clients.delete(oldestKey);
+      }
     }
 
     const headers: Record<string, string> = {};
@@ -199,7 +254,7 @@ export class OpencodeDaemon {
       headers,
       directory,
     });
-    this.clients.set(directory, client);
+    this.clients.set(directory, { client, lastUsed: Date.now() });
     return client;
   }
 }
