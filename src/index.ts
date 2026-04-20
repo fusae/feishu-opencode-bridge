@@ -1,4 +1,6 @@
+import path from "node:path";
 import process from "node:process";
+import { mkdir } from "node:fs/promises";
 import { loadEnv } from "./config.js";
 import { FeishuBridgeClient } from "./feishu.js";
 import { logError, logLine } from "./logger.js";
@@ -96,32 +98,35 @@ process.once("SIGTERM", shutdown);
 
 async function handleMessage(chatId: string, data: any): Promise<void> {
   const startedAt = Date.now();
+  const binding = state.getBinding(chatId);
   const text = feishu.extractText(data);
-  if (!text) {
+  const prompt = await buildInboundPrompt(chatId, data, binding?.directory);
+  if (!prompt) {
     return;
   }
-  await logLine(`[message] recv chat=${chatId} text=${JSON.stringify(text.slice(0, 120))}`);
+  await logLine(`[message] recv chat=${chatId} text=${JSON.stringify(prompt.slice(0, 120))}`);
 
   const pendingSelector = state.getPendingSelector(chatId);
   if (pendingSelector) {
-    const handled = await handleSelectorInput(chatId, text, pendingSelector);
-    if (handled) {
-      return;
+    if (text) {
+      const handled = await handleSelectorInput(chatId, text, pendingSelector);
+      if (handled) {
+        return;
+      }
     }
   }
 
-  if (await handleCommand(chatId, text)) {
+  if (text && await handleCommand(chatId, text)) {
     return;
   }
 
-  const binding = state.getBinding(chatId);
   const pendingQuestion = state.getPendingQuestion(chatId);
   if (binding && pendingQuestion) {
     try {
       const result = await opencode.prompt(
         binding.directory,
         pendingQuestion.sessionId,
-        buildQuestionAnswerPrompt(pendingQuestion.questions, text),
+        buildQuestionAnswerPrompt(pendingQuestion.questions, prompt),
       );
       await state.clearPendingQuestion(chatId);
       await deliverPromptResult(chatId, pendingQuestion.sessionId, result);
@@ -133,7 +138,7 @@ async function handleMessage(chatId: string, data: any): Promise<void> {
   }
 
   if (!binding) {
-    await startSelector(chatId, text);
+    await startSelector(chatId, prompt);
     return;
   }
 
@@ -142,10 +147,10 @@ async function handleMessage(chatId: string, data: any): Promise<void> {
     await state.updateBinding(chatId, { sessionId });
   }
 
-  const result = await opencode.prompt(binding.directory, sessionId, text);
+  const result = await opencode.prompt(binding.directory, sessionId, prompt);
   await deliverPromptResult(chatId, sessionId, result);
   console.log(
-    `[bridge] chat=${chatId} session=${sessionId} duration_ms=${Date.now() - startedAt} text=${JSON.stringify(text.slice(0, 80))}`,
+    `[bridge] chat=${chatId} session=${sessionId} duration_ms=${Date.now() - startedAt} text=${JSON.stringify(prompt.slice(0, 80))}`,
   );
   await logLine(`[message] done chat=${chatId} session=${sessionId} duration_ms=${Date.now() - startedAt}`);
 }
@@ -416,6 +421,44 @@ function buildQuestionAnswerPrompt(questions: string[], answer: string): string 
     "",
     "请基于这些补充信息继续完成刚才的任务，不要重复追问相同内容。",
   ].join("\n");
+}
+
+async function buildInboundPrompt(chatId: string, data: any, boundDirectory?: string): Promise<string | undefined> {
+  const messageType = feishu.getMessageType(data);
+  if (messageType === "file") {
+    return await buildFilePrompt(chatId, data, boundDirectory);
+  }
+  return feishu.extractText(data);
+}
+
+async function buildFilePrompt(chatId: string, data: any, boundDirectory?: string): Promise<string> {
+  const file = feishu.extractFile(data);
+  const messageId = feishu.getMessageId(data);
+  if (!file || !messageId) {
+    throw new Error("无法解析飞书文件消息。");
+  }
+
+  const uploadRoot = boundDirectory
+    ? path.join(boundDirectory, ".feishu_uploads")
+    : path.join(path.dirname(env.stateFilePath), "uploads", chatId);
+  await mkdir(uploadRoot, { recursive: true });
+
+  const safeName = sanitizeFileName(file.fileName ?? "upload.bin");
+  const savedPath = path.join(uploadRoot, `${Date.now()}-${messageId.slice(0, 8)}-${safeName}`);
+  await feishu.downloadFileFromMessage(messageId, file.fileKey, savedPath);
+
+  return [
+    "用户刚刚通过飞书上传了一个文件。",
+    `原始文件名：${file.fileName ?? safeName}`,
+    `文件已保存到：${savedPath}`,
+    "请先读取并使用这个文件，再继续处理用户的任务。",
+  ].join("\n");
+}
+
+function sanitizeFileName(fileName: string): string {
+  const trimmed = path.basename(fileName).trim();
+  const cleaned = trimmed.replace(/[\\/:*?"<>|\u0000-\u001F]/g, "_");
+  return cleaned || "upload.bin";
 }
 
 function formatQuestions(questions: string[]): string {

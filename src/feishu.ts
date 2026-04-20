@@ -67,6 +67,23 @@ function splitText(text: string, size = 3800): string[] {
   return chunks;
 }
 
+function parseJsonContent(content: unknown): Record<string, unknown> | undefined {
+  if (typeof content !== "string") {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(content);
+    return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export interface InboundFile {
+  fileKey: string;
+  fileName?: string;
+}
+
 function createTimeoutHttpInstance(defaultTimeoutMs: number): Lark.HttpInstance {
   const base = Lark.defaultHttpInstance as unknown as Lark.HttpInstance;
 
@@ -215,7 +232,7 @@ export class FeishuBridgeClient {
       }
     }
 
-    if (messageType !== "text" && messageType !== "post") {
+    if (messageType !== "text" && messageType !== "post" && messageType !== "file") {
       return isGroup ? "skip" : "unsupported";
     }
 
@@ -237,6 +254,38 @@ export class FeishuBridgeClient {
     } catch {
       return normalizeText(content);
     }
+  }
+
+  extractFile(data: any): InboundFile | undefined {
+    if (this.getMessageType(data) !== "file") {
+      return undefined;
+    }
+    const parsed = parseJsonContent(data?.message?.content);
+    const fileKey = typeof parsed?.file_key === "string" ? parsed.file_key.trim() : "";
+    if (!fileKey) {
+      return undefined;
+    }
+    const fileName =
+      typeof parsed?.file_name === "string" && parsed.file_name.trim()
+        ? parsed.file_name.trim()
+        : undefined;
+    return {
+      fileKey,
+      fileName,
+    };
+  }
+
+  async downloadFileFromMessage(messageId: string, fileKey: string, filePath: string): Promise<void> {
+    const response = await this.client.im.messageResource.get({
+      path: {
+        message_id: messageId,
+        file_key: fileKey,
+      },
+      params: {
+        type: "file",
+      },
+    });
+    await response.writeFile(filePath);
   }
 
   async sendText(chatId: string, text: string): Promise<void> {
