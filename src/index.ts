@@ -1,6 +1,6 @@
 import path from "node:path";
 import process from "node:process";
-import { mkdir } from "node:fs/promises";
+import { access, mkdir } from "node:fs/promises";
 import { loadEnv } from "./config.js";
 import { FeishuBridgeClient } from "./feishu.js";
 import { logError, logLine } from "./logger.js";
@@ -98,7 +98,7 @@ process.once("SIGTERM", shutdown);
 
 async function handleMessage(chatId: string, data: any): Promise<void> {
   const startedAt = Date.now();
-  const binding = state.getBinding(chatId);
+  const binding = await getResolvedBinding(chatId);
   const text = feishu.extractText(data);
   const prompt = await buildInboundPrompt(chatId, data, binding?.directory);
   if (!prompt) {
@@ -123,13 +123,15 @@ async function handleMessage(chatId: string, data: any): Promise<void> {
   const pendingQuestion = state.getPendingQuestion(chatId);
   if (binding && pendingQuestion) {
     try {
-      const result = await opencode.prompt(
+      const result = await promptWithRecovery(
+        chatId,
         binding.directory,
         pendingQuestion.sessionId,
         buildQuestionAnswerPrompt(pendingQuestion.questions, prompt),
       );
       await state.clearPendingQuestion(chatId);
-      await deliverPromptResult(chatId, pendingQuestion.sessionId, result);
+      const latestBinding = state.getBinding(chatId);
+      await deliverPromptResult(chatId, latestBinding?.sessionId ?? pendingQuestion.sessionId, result);
     } catch (error) {
       await logError("handleMessage.pendingQuestion", error, { chatId });
       throw error;
@@ -147,8 +149,9 @@ async function handleMessage(chatId: string, data: any): Promise<void> {
     await state.updateBinding(chatId, { sessionId });
   }
 
-  const result = await opencode.prompt(binding.directory, sessionId, prompt);
-  await deliverPromptResult(chatId, sessionId, result);
+  const result = await promptWithRecovery(chatId, binding.directory, sessionId, prompt);
+  const latestBinding = state.getBinding(chatId);
+  await deliverPromptResult(chatId, latestBinding?.sessionId ?? sessionId, result);
   console.log(
     `[bridge] chat=${chatId} session=${sessionId} duration_ms=${Date.now() - startedAt} text=${JSON.stringify(prompt.slice(0, 80))}`,
   );
@@ -339,8 +342,65 @@ async function bindProjectAndReplay(chatId: string, directory: string, pendingPr
 
   const sessionId = await opencode.createSession(directory, `Feishu ${chatId}`);
   await state.updateBinding(chatId, { sessionId });
-  const result = await opencode.prompt(directory, sessionId, pendingPrompt);
-  await deliverPromptResult(chatId, sessionId, result);
+  const result = await promptWithRecovery(chatId, directory, sessionId, pendingPrompt);
+  const latestBinding = state.getBinding(chatId);
+  await deliverPromptResult(chatId, latestBinding?.sessionId ?? sessionId, result);
+}
+
+async function getResolvedBinding(chatId: string) {
+  const binding = state.getBinding(chatId);
+  if (!binding) {
+    return undefined;
+  }
+
+  const directory = await resolveBindingDirectory(binding.directory);
+  if (directory === binding.directory) {
+    return binding;
+  }
+
+  await logLine(`[binding] remap chat=${chatId} from=${binding.directory} to=${directory}`);
+  await state.updateBinding(chatId, {
+    directory,
+    sessionId: undefined,
+  });
+
+  return {
+    ...binding,
+    directory,
+    sessionId: undefined,
+  };
+}
+
+async function resolveBindingDirectory(directory: string): Promise<string> {
+  if (await pathExists(directory)) {
+    return directory;
+  }
+
+  const marker = `${path.sep}Projects${path.sep}`;
+  const markerIndex = directory.lastIndexOf(marker);
+  if (markerIndex !== -1) {
+    const relativePath = directory.slice(markerIndex + marker.length);
+    const migrated = path.join(env.projectsRoot, relativePath);
+    if (await pathExists(migrated)) {
+      return migrated;
+    }
+  }
+
+  const byName = path.join(env.projectsRoot, path.basename(directory));
+  if (byName !== directory && await pathExists(byName)) {
+    return byName;
+  }
+
+  return directory;
+}
+
+async function pathExists(targetPath: string): Promise<boolean> {
+  try {
+    await access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function deliverPromptResult(chatId: string, sessionId: string, result: Awaited<ReturnType<OpencodeDaemon["prompt"]>>): Promise<void> {
@@ -421,6 +481,34 @@ function buildQuestionAnswerPrompt(questions: string[], answer: string): string 
     "",
     "请基于这些补充信息继续完成刚才的任务，不要重复追问相同内容。",
   ].join("\n");
+}
+
+async function promptWithRecovery(chatId: string, directory: string, sessionId: string, prompt: string): Promise<Awaited<ReturnType<OpencodeDaemon["prompt"]>>> {
+  try {
+    return await opencode.prompt(directory, sessionId, prompt);
+  } catch (error) {
+    if (!isSessionNotFoundError(error)) {
+      throw error;
+    }
+
+    await logLine(`[session] recreate chat=${chatId} old_session=${sessionId}`);
+    const newSessionId = await opencode.createSession(directory, `Feishu ${chatId}`);
+    await state.updateBinding(chatId, { sessionId: newSessionId });
+    return await opencode.prompt(directory, newSessionId, prompt);
+  }
+}
+
+function isSessionNotFoundError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/Session not found/i.test(message)) {
+    return true;
+  }
+  try {
+    const parsed = JSON.parse(message) as { message?: string };
+    return typeof parsed.message === "string" && /Session not found/i.test(parsed.message);
+  } catch {
+    return false;
+  }
 }
 
 async function buildInboundPrompt(chatId: string, data: any, boundDirectory?: string): Promise<string | undefined> {
