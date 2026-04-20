@@ -55,7 +55,7 @@ export function loadEnv(): BridgeEnv {
     feishuDomain: domainValue,
     feishuVerificationToken: process.env.FEISHU_VERIFICATION_TOKEN?.trim() || undefined,
     feishuEncryptKey: process.env.FEISHU_ENCRYPT_KEY?.trim() || undefined,
-    projectsRoot: path.resolve(resolveHome(process.env.PROJECTS_ROOT?.trim() || "~/Projects")),
+    projectsRoot: path.resolve(resolveHome(process.env.PROJECTS_ROOT?.trim() || "./projects")),
     stateFilePath: path.resolve(process.cwd(), process.env.STATE_FILE_PATH?.trim() || "./data/state.json"),
     groupRequireMention: toBool(process.env.GROUP_REQUIRE_MENTION, true),
     pageSize: toInt(process.env.PROJECT_PAGE_SIZE, 12, "PROJECT_PAGE_SIZE"),

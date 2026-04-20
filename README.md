@@ -3,7 +3,7 @@
 Connect a Feishu bot to [OpenCode](https://opencode.ai/) with:
 
 - Feishu persistent connection mode
-- interactive project picker from `~/Projects`
+- interactive project picker from your configured projects root
 - per-chat directory binding
 - per-chat OpenCode session reuse
 
@@ -51,7 +51,7 @@ FEISHU_APP_SECRET=xxx
 FEISHU_DOMAIN=Feishu
 FEISHU_VERIFICATION_TOKEN=
 FEISHU_ENCRYPT_KEY=
-PROJECTS_ROOT=~/Projects
+PROJECTS_ROOT=/path/to/projects
 PROJECT_PAGE_SIZE=12
 STATE_FILE_PATH=./data/state.json
 GROUP_REQUIRE_MENTION=true

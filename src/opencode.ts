@@ -65,6 +65,13 @@ export class OpencodeDaemon {
       return;
     }
 
+    const existingServerUrl = this.getServerUrl();
+    if (await this.canConnect(existingServerUrl)) {
+      this.serverUrl = existingServerUrl;
+      await logLine(`[opencode] reuse existing server url=${existingServerUrl}`);
+      return;
+    }
+
     const MAX_RETRIES = 3;
     let lastError: unknown;
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt += 1) {
@@ -256,6 +263,29 @@ export class OpencodeDaemon {
     });
     this.clients.set(directory, { client, lastUsed: Date.now() });
     return client;
+  }
+
+  private getServerUrl(): string {
+    return `http://${this.env.opencodeServerHostname}:${this.env.opencodeServerPort}`;
+  }
+
+  private async canConnect(baseUrl: string): Promise<boolean> {
+    try {
+      const headers: Record<string, string> = {};
+      if (this.env.opencodeServerPassword) {
+        headers.authorization = toBasicAuth(this.env.opencodeServerUsername, this.env.opencodeServerPassword);
+      }
+
+      const client = createOpencodeClient({
+        baseUrl,
+        headers,
+        directory: this.env.projectsRoot,
+      });
+      const result = await client.session.list();
+      return !result.error;
+    } catch {
+      return false;
+    }
   }
 }
 
