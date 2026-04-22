@@ -682,7 +682,8 @@ async function buildImagePrompt(chatId: string, data: any, boundDirectory?: stri
   return [
     "用户刚刚通过飞书发送了一张图片。",
     `图片已保存到：${savedPath}`,
-    "请先查看并使用这张图片，再继续处理用户的任务。",
+    "先调用 zai-mcp-server_analyze_image 分析这张图片，再继续处理用户的任务。",
+    `image_source 请直接使用这个本地路径：${savedPath}`,
   ].join("\n");
 }
 
@@ -704,7 +705,9 @@ async function buildMediaPrompt(chatId: string, data: any, boundDirectory?: stri
     media.duration ? `时长：${media.duration} ms` : undefined,
     `文件已保存到：${savedPath}`,
     media.imageKey ? "该消息还带有封面图，可按需进一步获取。" : undefined,
-    "请先读取并使用这个媒体文件，再继续处理用户的任务。",
+    "如果这是视频且文件大小与格式满足工具限制，先调用 zai-mcp-server_analyze_video 分析它，再继续处理用户的任务。",
+    `video_source 请直接使用这个本地路径：${savedPath}`,
+    "如果不是可直接分析的视频，再基于这个本地文件路径继续处理。",
   ].filter(Boolean).join("\n");
 }
 
