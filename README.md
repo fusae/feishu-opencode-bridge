@@ -114,6 +114,28 @@ No separate public webhook endpoint is required for this bridge.
 /search x  Filter projects by keyword
 ```
 
+Command notes:
+
+- `/switch`: clear the current chat binding and reopen the project picker
+- `/status`: show the current project directory and active session id
+- `/reset`: drop the active session binding for the chat and let the next message start a fresh session
+- `/session`: list recent sessions in the current project
+- `/session current`: show the currently active session id
+- `/session new`: create and switch to a new session in the current project
+- `/session use <id|index>`: switch to an existing session by full id, id prefix, or list index
+- `/session delete <id|index>`: delete a session by full id, id prefix, or list index
+- `/next` and `/prev`: paginate the project picker
+- `/search x`: filter the project picker by keyword
+
+Example session flow:
+
+```text
+/session
+/session new
+/session use 2
+/session delete ses_xxx
+```
+
 ## State
 
 Runtime state is stored in:
