@@ -84,6 +84,17 @@ export interface InboundFile {
   fileName?: string;
 }
 
+export interface InboundImage {
+  imageKey: string;
+}
+
+export interface InboundMedia {
+  fileKey: string;
+  imageKey?: string;
+  fileName?: string;
+  duration?: number;
+}
+
 function createTimeoutHttpInstance(defaultTimeoutMs: number): Lark.HttpInstance {
   const base = Lark.defaultHttpInstance as unknown as Lark.HttpInstance;
 
@@ -232,7 +243,7 @@ export class FeishuBridgeClient {
       }
     }
 
-    if (messageType !== "text" && messageType !== "post" && messageType !== "file") {
+    if (messageType !== "text" && messageType !== "post" && messageType !== "file" && messageType !== "image" && messageType !== "media") {
       return isGroup ? "skip" : "unsupported";
     }
 
@@ -275,6 +286,46 @@ export class FeishuBridgeClient {
     };
   }
 
+  extractImage(data: any): InboundImage | undefined {
+    if (this.getMessageType(data) !== "image") {
+      return undefined;
+    }
+    const parsed = parseJsonContent(data?.message?.content);
+    const imageKey = typeof parsed?.image_key === "string" ? parsed.image_key.trim() : "";
+    if (!imageKey) {
+      return undefined;
+    }
+    return {
+      imageKey,
+    };
+  }
+
+  extractMedia(data: any): InboundMedia | undefined {
+    if (this.getMessageType(data) !== "media") {
+      return undefined;
+    }
+    const parsed = parseJsonContent(data?.message?.content);
+    const fileKey = typeof parsed?.file_key === "string" ? parsed.file_key.trim() : "";
+    if (!fileKey) {
+      return undefined;
+    }
+    const imageKey = typeof parsed?.image_key === "string" && parsed.image_key.trim()
+      ? parsed.image_key.trim()
+      : undefined;
+    const fileName = typeof parsed?.file_name === "string" && parsed.file_name.trim()
+      ? parsed.file_name.trim()
+      : undefined;
+    const duration = typeof parsed?.duration === "number" && Number.isFinite(parsed.duration)
+      ? parsed.duration
+      : undefined;
+    return {
+      fileKey,
+      imageKey,
+      fileName,
+      duration,
+    };
+  }
+
   async downloadFileFromMessage(messageId: string, fileKey: string, filePath: string): Promise<void> {
     const response = await this.client.im.messageResource.get({
       path: {
@@ -283,6 +334,32 @@ export class FeishuBridgeClient {
       },
       params: {
         type: "file",
+      },
+    });
+    await response.writeFile(filePath);
+  }
+
+  async downloadImageFromMessage(messageId: string, imageKey: string, filePath: string): Promise<void> {
+    const response = await this.client.im.messageResource.get({
+      path: {
+        message_id: messageId,
+        file_key: imageKey,
+      },
+      params: {
+        type: "image",
+      },
+    });
+    await response.writeFile(filePath);
+  }
+
+  async downloadMediaFromMessage(messageId: string, fileKey: string, filePath: string): Promise<void> {
+    const response = await this.client.im.messageResource.get({
+      path: {
+        message_id: messageId,
+        file_key: fileKey,
+      },
+      params: {
+        type: "media",
       },
     });
     await response.writeFile(filePath);
@@ -409,7 +486,7 @@ export class FeishuBridgeClient {
       elements: [
         {
           tag: "plain_text",
-          content: "仍支持文本命令：/search 关键词 /switch /status /reset",
+          content: "仍支持文本命令：/search 关键词 /switch /status /reset /session",
         },
       ],
     });

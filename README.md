@@ -104,6 +104,11 @@ No separate public webhook endpoint is required for this bridge.
 /switch    Open the project picker again
 /status    Show the currently bound directory
 /reset     Reset the current OpenCode session for this chat
+/session   List sessions for the current project
+/session current
+/session new
+/session use <id|index>
+/session delete <id|index>
 /next      Next page in the project picker
 /prev      Previous page in the project picker
 /search x  Filter projects by keyword

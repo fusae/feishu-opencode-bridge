@@ -170,17 +170,17 @@ async function handleCommand(chatId: string, text: string): Promise<boolean> {
   }
 
   if (trimmed === "/status") {
-    const binding = state.getBinding(chatId);
+    const binding = await getResolvedBinding(chatId);
     if (!binding) {
       await feishu.sendText(chatId, "当前未绑定项目目录。");
       return true;
     }
-    await feishu.sendText(chatId, `当前目录：${binding.directory}`);
+    await feishu.sendText(chatId, `当前目录：${binding.directory}${binding.sessionId ? `\n当前会话：${binding.sessionId}` : ""}`);
     return true;
   }
 
   if (trimmed === "/reset") {
-    const binding = state.getBinding(chatId);
+    const binding = await getResolvedBinding(chatId);
     if (!binding) {
       await feishu.sendText(chatId, "当前没有可重置的会话。");
       return true;
@@ -189,6 +189,10 @@ async function handleCommand(chatId: string, text: string): Promise<boolean> {
     await state.clearPendingQuestion(chatId);
     await feishu.sendText(chatId, "已重置当前目录对应的 OpenCode 会话。");
     return true;
+  }
+
+  if (trimmed === "/session" || trimmed.startsWith("/session ")) {
+    return await handleSessionCommand(chatId, trimmed);
   }
 
   if (
@@ -240,6 +244,121 @@ async function handleCommand(chatId: string, text: string): Promise<boolean> {
   }
 
   return false;
+}
+
+async function handleSessionCommand(chatId: string, text: string): Promise<boolean> {
+  const binding = await getResolvedBinding(chatId);
+  if (!binding) {
+    await feishu.sendText(chatId, "当前未绑定项目目录。先用 /switch 选择项目。");
+    return true;
+  }
+
+  const parts = text.split(/\s+/).filter(Boolean);
+  const action = (parts[1] ?? "list").toLowerCase();
+
+  if (action === "list") {
+    const sessions = await opencode.listSessions(binding.directory);
+    await feishu.sendText(chatId, formatSessionList(binding, sessions));
+    return true;
+  }
+
+  if (action === "current") {
+    await feishu.sendText(chatId, binding.sessionId ? `当前会话：${binding.sessionId}` : "当前还没有活跃会话。");
+    return true;
+  }
+
+  if (action === "new") {
+    const sessionId = await opencode.createSession(binding.directory, `Feishu ${chatId}`);
+    await state.updateBinding(chatId, { sessionId });
+    await state.clearPendingQuestion(chatId);
+    await feishu.sendText(chatId, `已创建并切换到新会话：${sessionId}`);
+    return true;
+  }
+
+  if (action === "use") {
+    const target = parts[2];
+    if (!target) {
+      await feishu.sendText(chatId, "用法：/session use <会话ID或序号>");
+      return true;
+    }
+    const sessions = await opencode.listSessions(binding.directory);
+    const matched = findSessionTarget(sessions, target);
+    if (!matched) {
+      await feishu.sendText(chatId, "没找到对应会话。先用 /session list 查看。");
+      return true;
+    }
+    await state.updateBinding(chatId, { sessionId: matched.id });
+    await state.clearPendingQuestion(chatId);
+    await feishu.sendText(chatId, `已切换会话：${matched.id}`);
+    return true;
+  }
+
+  if (action === "delete") {
+    const target = parts[2];
+    if (!target) {
+      await feishu.sendText(chatId, "用法：/session delete <会话ID或序号>");
+      return true;
+    }
+    const sessions = await opencode.listSessions(binding.directory);
+    const matched = findSessionTarget(sessions, target);
+    if (!matched) {
+      await feishu.sendText(chatId, "没找到对应会话。先用 /session list 查看。");
+      return true;
+    }
+    await opencode.deleteSession(binding.directory, matched.id);
+    if (binding.sessionId === matched.id) {
+      await state.updateBinding(chatId, { sessionId: undefined });
+      await state.clearPendingQuestion(chatId);
+    }
+    await feishu.sendText(chatId, `已删除会话：${matched.id}`);
+    return true;
+  }
+
+  await feishu.sendText(chatId, "支持：/session list | /session current | /session new | /session use <ID或序号> | /session delete <ID或序号>");
+  return true;
+}
+
+function findSessionTarget(
+  sessions: Awaited<ReturnType<OpencodeDaemon["listSessions"]>>,
+  target: string,
+) {
+  const index = Number(target);
+  if (Number.isInteger(index) && index > 0) {
+    return sessions[index - 1];
+  }
+
+  const exact = sessions.find((session) => session.id === target);
+  if (exact) {
+    return exact;
+  }
+
+  const prefixMatches = sessions.filter((session) => session.id.startsWith(target));
+  if (prefixMatches.length === 1) {
+    return prefixMatches[0];
+  }
+
+  return undefined;
+}
+
+function formatSessionList(
+  binding: NonNullable<Awaited<ReturnType<typeof getResolvedBinding>>>,
+  sessions: Awaited<ReturnType<OpencodeDaemon["listSessions"]>>,
+): string {
+  if (sessions.length === 0) {
+    return "当前目录下还没有会话。";
+  }
+
+  return [
+    `当前目录：${binding.directory}`,
+    ...sessions.slice(0, 12).map((session, index) => {
+      const label = binding.sessionId === session.id ? " [当前]" : "";
+      const title = session.title ? ` ${session.title}` : "";
+      return `${index + 1}. ${session.id}${label}${title}`;
+    }),
+    sessions.length > 12 ? `还有 ${sessions.length - 12} 个未显示。` : undefined,
+    "",
+    "用法：/session use 2 或 /session use ses_xxx",
+  ].filter(Boolean).join("\n");
 }
 
 async function handleSelectorInput(chatId: string, text: string, selector: { page: number; query: string; pendingPrompt?: string }): Promise<boolean> {
@@ -516,6 +635,12 @@ async function buildInboundPrompt(chatId: string, data: any, boundDirectory?: st
   if (messageType === "file") {
     return await buildFilePrompt(chatId, data, boundDirectory);
   }
+  if (messageType === "image") {
+    return await buildImagePrompt(chatId, data, boundDirectory);
+  }
+  if (messageType === "media") {
+    return await buildMediaPrompt(chatId, data, boundDirectory);
+  }
   return feishu.extractText(data);
 }
 
@@ -541,6 +666,54 @@ async function buildFilePrompt(chatId: string, data: any, boundDirectory?: strin
     `文件已保存到：${savedPath}`,
     "请先读取并使用这个文件，再继续处理用户的任务。",
   ].join("\n");
+}
+
+async function buildImagePrompt(chatId: string, data: any, boundDirectory?: string): Promise<string> {
+  const image = feishu.extractImage(data);
+  const messageId = feishu.getMessageId(data);
+  if (!image || !messageId) {
+    throw new Error("无法解析飞书图片消息。");
+  }
+
+  const uploadRoot = await ensureUploadRoot(chatId, boundDirectory);
+  const savedPath = path.join(uploadRoot, `${Date.now()}-${messageId.slice(0, 8)}-image.png`);
+  await feishu.downloadImageFromMessage(messageId, image.imageKey, savedPath);
+
+  return [
+    "用户刚刚通过飞书发送了一张图片。",
+    `图片已保存到：${savedPath}`,
+    "请先查看并使用这张图片，再继续处理用户的任务。",
+  ].join("\n");
+}
+
+async function buildMediaPrompt(chatId: string, data: any, boundDirectory?: string): Promise<string> {
+  const media = feishu.extractMedia(data);
+  const messageId = feishu.getMessageId(data);
+  if (!media || !messageId) {
+    throw new Error("无法解析飞书视频消息。");
+  }
+
+  const uploadRoot = await ensureUploadRoot(chatId, boundDirectory);
+  const safeName = sanitizeFileName(media.fileName ?? "video.mp4");
+  const savedPath = path.join(uploadRoot, `${Date.now()}-${messageId.slice(0, 8)}-${safeName}`);
+  await feishu.downloadMediaFromMessage(messageId, media.fileKey, savedPath);
+
+  return [
+    "用户刚刚通过飞书发送了一个视频或音频文件。",
+    `原始文件名：${media.fileName ?? safeName}`,
+    media.duration ? `时长：${media.duration} ms` : undefined,
+    `文件已保存到：${savedPath}`,
+    media.imageKey ? "该消息还带有封面图，可按需进一步获取。" : undefined,
+    "请先读取并使用这个媒体文件，再继续处理用户的任务。",
+  ].filter(Boolean).join("\n");
+}
+
+async function ensureUploadRoot(chatId: string, boundDirectory?: string): Promise<string> {
+  const uploadRoot = boundDirectory
+    ? path.join(boundDirectory, ".feishu_uploads")
+    : path.join(path.dirname(env.stateFilePath), "uploads", chatId);
+  await mkdir(uploadRoot, { recursive: true });
+  return uploadRoot;
 }
 
 function sanitizeFileName(fileName: string): string {

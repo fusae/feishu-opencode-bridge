@@ -51,6 +51,14 @@ export type PromptResult =
       questions: string[];
     };
 
+export interface SessionInfo {
+  id: string;
+  directory?: string;
+  title?: string;
+  createdAt?: number;
+  updatedAt?: number;
+}
+
 const MAX_CLIENTS = 50;
 
 export class OpencodeDaemon {
@@ -110,6 +118,35 @@ export class OpencodeDaemon {
       throw new Error("failed to create opencode session");
     }
     return result.data.id;
+  }
+
+  async listSessions(directory: string): Promise<SessionInfo[]> {
+    const client = this.getClient(directory);
+    const result = await client.session.list();
+    if (result.error) {
+      throw new Error(JSON.stringify(result.error));
+    }
+    return (result.data ?? [])
+      .map((item) => ({
+        id: item.id,
+        directory: item.directory,
+        title: item.title,
+        createdAt: item.time?.created,
+        updatedAt: item.time?.updated,
+      }))
+      .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+  }
+
+  async deleteSession(directory: string, sessionId: string): Promise<void> {
+    const client = this.getClient(directory);
+    const result = await client.session.delete({
+      path: {
+        id: sessionId,
+      },
+    });
+    if (result.error) {
+      throw new Error(JSON.stringify(result.error));
+    }
   }
 
   async prompt(directory: string, sessionId: string, text: string): Promise<PromptResult> {
