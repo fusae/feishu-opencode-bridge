@@ -641,7 +641,46 @@ async function buildInboundPrompt(chatId: string, data: any, boundDirectory?: st
   if (messageType === "media") {
     return await buildMediaPrompt(chatId, data, boundDirectory);
   }
+  if (messageType === "post") {
+    return await buildPostPrompt(chatId, data, boundDirectory);
+  }
   return feishu.extractText(data);
+}
+
+async function buildPostPrompt(chatId: string, data: any, boundDirectory?: string): Promise<string | undefined> {
+  const post = feishu.extractPost(data);
+  if (!post) {
+    return feishu.extractText(data);
+  }
+
+  if (post.images.length === 0) {
+    return post.text;
+  }
+
+  const messageId = feishu.getMessageId(data);
+  if (!messageId) {
+    throw new Error("无法解析飞书富文本消息。");
+  }
+
+  const uploadRoot = await ensureUploadRoot(chatId, boundDirectory);
+  const imagePrompts: string[] = [];
+
+  for (const [index, image] of post.images.entries()) {
+    const suffix = post.images.length === 1 ? "image.png" : `image-${index + 1}.png`;
+    const savedPath = path.join(uploadRoot, `${Date.now()}-${messageId.slice(0, 8)}-${suffix}`);
+    await feishu.downloadImageFromMessage(messageId, image.imageKey, savedPath);
+    imagePrompts.push([
+      `富文本图片 ${index + 1} 已保存到：${savedPath}`,
+      "先调用 zai-mcp-server_analyze_image 分析这张图片，再继续处理用户的任务。",
+      `image_source 请直接使用这个本地路径：${savedPath}`,
+    ].join("\n"));
+  }
+
+  return [
+    post.text ? `用户文字：${post.text}` : undefined,
+    "用户发送了一条带图片的富文本消息。",
+    ...imagePrompts,
+  ].filter(Boolean).join("\n\n");
 }
 
 async function buildFilePrompt(chatId: string, data: any, boundDirectory?: string): Promise<string> {

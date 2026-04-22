@@ -55,6 +55,42 @@ function extractPostText(content: unknown): string | undefined {
   return normalizeText(merged);
 }
 
+function extractPostImages(content: unknown): InboundImage[] {
+  if (!content || typeof content !== "object") {
+    return [];
+  }
+
+  const root = content as Record<string, unknown>;
+  const locale =
+    (root.zh_cn as Record<string, unknown> | undefined) ??
+    (root.en_us as Record<string, unknown> | undefined) ??
+    root;
+  const blocks = Array.isArray(locale.content) ? locale.content : [];
+  const images: InboundImage[] = [];
+
+  for (const block of blocks) {
+    if (!Array.isArray(block)) {
+      continue;
+    }
+    for (const item of block) {
+      if (!item || typeof item !== "object") {
+        continue;
+      }
+      const record = item as Record<string, unknown>;
+      if (record.tag !== "img") {
+        continue;
+      }
+      const imageKey = typeof record.image_key === "string" ? record.image_key.trim() : "";
+      if (!imageKey) {
+        continue;
+      }
+      images.push({ imageKey });
+    }
+  }
+
+  return images;
+}
+
 function splitText(text: string, size = 3800): string[] {
   const chars = Array.from(text);
   if (chars.length <= size) {
@@ -93,6 +129,11 @@ export interface InboundMedia {
   imageKey?: string;
   fileName?: string;
   duration?: number;
+}
+
+export interface InboundPost {
+  text?: string;
+  images: InboundImage[];
 }
 
 function createTimeoutHttpInstance(defaultTimeoutMs: number): Lark.HttpInstance {
@@ -323,6 +364,20 @@ export class FeishuBridgeClient {
       imageKey,
       fileName,
       duration,
+    };
+  }
+
+  extractPost(data: any): InboundPost | undefined {
+    if (this.getMessageType(data) !== "post") {
+      return undefined;
+    }
+    const parsed = parseJsonContent(data?.message?.content);
+    if (!parsed) {
+      return undefined;
+    }
+    return {
+      text: extractPostText(parsed),
+      images: extractPostImages(parsed),
     };
   }
 
