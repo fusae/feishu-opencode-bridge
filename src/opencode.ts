@@ -1,4 +1,5 @@
 import { createOpencodeClient, createOpencodeServer, type OpencodeClient, type Part } from "@opencode-ai/sdk";
+import type { AgentBackend, BackendPromptResponse, PromptInput, PromptResult, SessionInfo } from "./backend.js";
 import { logError, logLine } from "./logger.js";
 import type { BridgeEnv } from "./types.js";
 
@@ -41,27 +42,10 @@ function extractQuestions(parts: Part[]): string[] {
   return questions;
 }
 
-export type PromptResult =
-  | {
-      type: "reply";
-      text: string;
-    }
-  | {
-      type: "question";
-      questions: string[];
-    };
-
-export interface SessionInfo {
-  id: string;
-  directory?: string;
-  title?: string;
-  createdAt?: number;
-  updatedAt?: number;
-}
-
 const MAX_CLIENTS = 50;
 
-export class OpencodeDaemon {
+export class OpencodeDaemon implements AgentBackend {
+  readonly name = "OpenCode";
   private serverUrl?: string;
   private serverCloser?: { close(): void };
   private readonly clients = new Map<string, { client: OpencodeClient; lastUsed: number }>();
@@ -149,10 +133,11 @@ export class OpencodeDaemon {
     }
   }
 
-  async prompt(directory: string, sessionId: string, text: string): Promise<PromptResult> {
+  async prompt(directory: string, sessionId: string | undefined, input: PromptInput): Promise<BackendPromptResponse> {
+    const activeSessionId = sessionId ?? await this.createSession(directory, "Feishu");
     const client = this.getClient(directory);
     const beforeMessages = await client.session.messages({
-      path: { id: sessionId },
+      path: { id: activeSessionId },
     });
     if (beforeMessages.error) {
       throw new Error(JSON.stringify(beforeMessages.error));
@@ -165,13 +150,13 @@ export class OpencodeDaemon {
     );
 
     const accepted = await client.session.promptAsync({
-      path: { id: sessionId },
+      path: { id: activeSessionId },
       body: {
         system: this.env.opencodeSystemPrompt,
         parts: [
           {
             type: "text",
-            text,
+            text: input.text,
           },
         ],
       },
@@ -189,11 +174,11 @@ export class OpencodeDaemon {
       let messages: Awaited<ReturnType<typeof client.session.messages>>;
       try {
         messages = await client.session.messages({
-          path: { id: sessionId },
+          path: { id: activeSessionId },
         });
       } catch (error) {
         consecutiveErrors += 1;
-        await logError("opencode.prompt.poll", error, { sessionId, consecutiveErrors });
+        await logError("opencode.prompt.poll", error, { sessionId: activeSessionId, consecutiveErrors });
         if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
           throw error;
         }
@@ -202,7 +187,7 @@ export class OpencodeDaemon {
 
       if ("error" in messages && messages.error) {
         consecutiveErrors += 1;
-        await logError("opencode.prompt.poll", messages.error, { sessionId, consecutiveErrors });
+        await logError("opencode.prompt.poll", messages.error, { sessionId: activeSessionId, consecutiveErrors });
         if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
           throw new Error(JSON.stringify(messages.error));
         }
@@ -230,10 +215,13 @@ export class OpencodeDaemon {
 
       const questions = extractQuestions(latestAssistant.parts ?? []);
       if (questions.length > 0) {
-        await this.abort(directory, sessionId);
+        await this.abort(directory, activeSessionId);
         return {
-          type: "question",
-          questions,
+          sessionId: activeSessionId,
+          result: {
+            type: "question",
+            questions,
+          },
         };
       }
 
@@ -246,12 +234,28 @@ export class OpencodeDaemon {
         throw new Error("opencode returned empty text response");
       }
       return {
-        type: "reply",
-        text: reply,
+        sessionId: activeSessionId,
+        result: {
+          type: "reply",
+          text: reply,
+        },
       };
     }
 
     throw new Error("opencode response timeout");
+  }
+
+  isSessionNotFoundError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/Session not found/i.test(message)) {
+      return true;
+    }
+    try {
+      const parsed = JSON.parse(message) as { message?: string };
+      return typeof parsed.message === "string" && /Session not found/i.test(parsed.message);
+    } catch {
+      return false;
+    }
   }
 
   async abort(directory: string, sessionId: string): Promise<void> {

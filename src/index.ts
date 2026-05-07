@@ -1,7 +1,9 @@
 import path from "node:path";
 import process from "node:process";
 import { access, mkdir } from "node:fs/promises";
+import type { AgentBackend, BackendPromptResponse, PromptInput, PromptResult, SessionInfo } from "./backend.js";
 import { loadEnv } from "./config.js";
+import { CodexDaemon } from "./codex.js";
 import { FeishuBridgeClient } from "./feishu.js";
 import { logError, logLine } from "./logger.js";
 import { OpencodeDaemon } from "./opencode.js";
@@ -14,8 +16,8 @@ const state = new StateStore(env.stateFilePath);
 await state.init();
 
 const feishu = new FeishuBridgeClient(env);
-const opencode = new OpencodeDaemon(env);
-await opencode.start();
+const backend: AgentBackend = env.backend === "codex" ? new CodexDaemon(env) : new OpencodeDaemon(env);
+await backend.start();
 
 const queues = new Map<string, Promise<void>>();
 const inflightMessageIds = new Set<string>();
@@ -91,7 +93,7 @@ await feishu.start({
   },
 });
 
-console.log(`feishu-opencode-bridge started, projects root: ${env.projectsRoot}`);
+console.log(`feishu-opencode-bridge started, backend: ${backend.name}, projects root: ${env.projectsRoot}`);
 
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
@@ -104,7 +106,7 @@ async function handleMessage(chatId: string, data: any): Promise<void> {
   if (!prompt) {
     return;
   }
-  await logLine(`[message] recv chat=${chatId} text=${JSON.stringify(prompt.slice(0, 120))}`);
+  await logLine(`[message] recv chat=${chatId} text=${JSON.stringify(prompt.text.slice(0, 120))}`);
 
   const pendingSelector = state.getPendingSelector(chatId);
   if (pendingSelector) {
@@ -123,15 +125,15 @@ async function handleMessage(chatId: string, data: any): Promise<void> {
   const pendingQuestion = state.getPendingQuestion(chatId);
   if (binding && pendingQuestion) {
     try {
-      const result = await promptWithRecovery(
+      const response = await promptWithRecovery(
         chatId,
         binding.directory,
         pendingQuestion.sessionId,
         buildQuestionAnswerPrompt(pendingQuestion.questions, prompt),
       );
       await state.clearPendingQuestion(chatId);
-      const latestBinding = state.getBinding(chatId);
-      await deliverPromptResult(chatId, latestBinding?.sessionId ?? pendingQuestion.sessionId, result);
+      await state.updateBinding(chatId, { sessionId: response.sessionId });
+      await deliverPromptResult(chatId, response.sessionId, response.result);
     } catch (error) {
       await logError("handleMessage.pendingQuestion", error, { chatId });
       throw error;
@@ -144,18 +146,13 @@ async function handleMessage(chatId: string, data: any): Promise<void> {
     return;
   }
 
-  const sessionId = binding.sessionId ?? await opencode.createSession(binding.directory, `Feishu ${chatId}`);
-  if (!binding.sessionId) {
-    await state.updateBinding(chatId, { sessionId });
-  }
-
-  const result = await promptWithRecovery(chatId, binding.directory, sessionId, prompt);
-  const latestBinding = state.getBinding(chatId);
-  await deliverPromptResult(chatId, latestBinding?.sessionId ?? sessionId, result);
+  const response = await promptWithRecovery(chatId, binding.directory, binding.sessionId, prompt);
+  await state.updateBinding(chatId, { sessionId: response.sessionId });
+  await deliverPromptResult(chatId, response.sessionId, response.result);
   console.log(
-    `[bridge] chat=${chatId} session=${sessionId} duration_ms=${Date.now() - startedAt} text=${JSON.stringify(prompt.slice(0, 80))}`,
+    `[bridge] chat=${chatId} session=${response.sessionId} duration_ms=${Date.now() - startedAt} text=${JSON.stringify(prompt.text.slice(0, 80))}`,
   );
-  await logLine(`[message] done chat=${chatId} session=${sessionId} duration_ms=${Date.now() - startedAt}`);
+  await logLine(`[message] done chat=${chatId} session=${response.sessionId} duration_ms=${Date.now() - startedAt}`);
 }
 
 async function handleCommand(chatId: string, text: string): Promise<boolean> {
@@ -187,7 +184,7 @@ async function handleCommand(chatId: string, text: string): Promise<boolean> {
     }
     await state.updateBinding(chatId, { sessionId: undefined });
     await state.clearPendingQuestion(chatId);
-    await feishu.sendText(chatId, "已重置当前目录对应的 OpenCode 会话。");
+    await feishu.sendText(chatId, `已重置当前目录对应的 ${backend.name} 会话。`);
     return true;
   }
 
@@ -257,7 +254,7 @@ async function handleSessionCommand(chatId: string, text: string): Promise<boole
   const action = (parts[1] ?? "list").toLowerCase();
 
   if (action === "list") {
-    const sessions = await opencode.listSessions(binding.directory);
+    const sessions = await backend.listSessions(binding.directory);
     await feishu.sendText(chatId, formatSessionList(binding, sessions));
     return true;
   }
@@ -268,7 +265,7 @@ async function handleSessionCommand(chatId: string, text: string): Promise<boole
   }
 
   if (action === "new") {
-    const sessionId = await opencode.createSession(binding.directory, `Feishu ${chatId}`);
+    const sessionId = await backend.createSession(binding.directory, `Feishu ${chatId}`);
     await state.updateBinding(chatId, { sessionId });
     await state.clearPendingQuestion(chatId);
     await feishu.sendText(chatId, `已创建并切换到新会话：${sessionId}`);
@@ -281,7 +278,7 @@ async function handleSessionCommand(chatId: string, text: string): Promise<boole
       await feishu.sendText(chatId, "用法：/session use <会话ID或序号>");
       return true;
     }
-    const sessions = await opencode.listSessions(binding.directory);
+    const sessions = await backend.listSessions(binding.directory);
     const matched = findSessionTarget(sessions, target);
     if (!matched) {
       await feishu.sendText(chatId, "没找到对应会话。先用 /session list 查看。");
@@ -299,13 +296,13 @@ async function handleSessionCommand(chatId: string, text: string): Promise<boole
       await feishu.sendText(chatId, "用法：/session delete <会话ID或序号>");
       return true;
     }
-    const sessions = await opencode.listSessions(binding.directory);
+    const sessions = await backend.listSessions(binding.directory);
     const matched = findSessionTarget(sessions, target);
     if (!matched) {
       await feishu.sendText(chatId, "没找到对应会话。先用 /session list 查看。");
       return true;
     }
-    await opencode.deleteSession(binding.directory, matched.id);
+    await backend.deleteSession(binding.directory, matched.id);
     if (binding.sessionId === matched.id) {
       await state.updateBinding(chatId, { sessionId: undefined });
       await state.clearPendingQuestion(chatId);
@@ -319,7 +316,7 @@ async function handleSessionCommand(chatId: string, text: string): Promise<boole
 }
 
 function findSessionTarget(
-  sessions: Awaited<ReturnType<OpencodeDaemon["listSessions"]>>,
+  sessions: SessionInfo[],
   target: string,
 ) {
   const index = Number(target);
@@ -342,7 +339,7 @@ function findSessionTarget(
 
 function formatSessionList(
   binding: NonNullable<Awaited<ReturnType<typeof getResolvedBinding>>>,
-  sessions: Awaited<ReturnType<OpencodeDaemon["listSessions"]>>,
+  sessions: SessionInfo[],
 ): string {
   if (sessions.length === 0) {
     return "当前目录下还没有会话。";
@@ -361,7 +358,7 @@ function formatSessionList(
   ].filter(Boolean).join("\n");
 }
 
-async function handleSelectorInput(chatId: string, text: string, selector: { page: number; query: string; pendingPrompt?: string }): Promise<boolean> {
+async function handleSelectorInput(chatId: string, text: string, selector: { page: number; query: string; pendingPrompt?: PromptInput }): Promise<boolean> {
   const choice = Number(text.trim());
   if (!Number.isInteger(choice) || choice <= 0) {
     return false;
@@ -383,7 +380,7 @@ async function handleSelectorInput(chatId: string, text: string, selector: { pag
   return true;
 }
 
-async function startSelector(chatId: string, pendingPrompt?: string): Promise<void> {
+async function startSelector(chatId: string, pendingPrompt?: PromptInput): Promise<void> {
   await state.setPendingSelector(chatId, {
     page: 0,
     query: "",
@@ -448,7 +445,7 @@ async function handleCardAction(value: CardActionValue): Promise<void> {
   });
 }
 
-async function bindProjectAndReplay(chatId: string, directory: string, pendingPrompt?: string): Promise<void> {
+async function bindProjectAndReplay(chatId: string, directory: string, pendingPrompt?: PromptInput): Promise<void> {
   await state.setBinding(chatId, {
     directory,
   });
@@ -459,11 +456,9 @@ async function bindProjectAndReplay(chatId: string, directory: string, pendingPr
     return;
   }
 
-  const sessionId = await opencode.createSession(directory, `Feishu ${chatId}`);
-  await state.updateBinding(chatId, { sessionId });
-  const result = await promptWithRecovery(chatId, directory, sessionId, pendingPrompt);
-  const latestBinding = state.getBinding(chatId);
-  await deliverPromptResult(chatId, latestBinding?.sessionId ?? sessionId, result);
+  const response = await promptWithRecovery(chatId, directory, undefined, pendingPrompt);
+  await state.updateBinding(chatId, { sessionId: response.sessionId });
+  await deliverPromptResult(chatId, response.sessionId, response.result);
 }
 
 async function getResolvedBinding(chatId: string) {
@@ -522,7 +517,7 @@ async function pathExists(targetPath: string): Promise<boolean> {
   }
 }
 
-async function deliverPromptResult(chatId: string, sessionId: string, result: Awaited<ReturnType<OpencodeDaemon["prompt"]>>): Promise<void> {
+async function deliverPromptResult(chatId: string, sessionId: string, result: PromptResult): Promise<void> {
   if (result.type === "reply") {
     await feishu.sendText(chatId, result.text);
     await logLine(`[reply] sent chat=${chatId} session=${sessionId} chars=${result.text.length}`);
@@ -590,47 +585,36 @@ function formatError(error: unknown): string {
   return String(error);
 }
 
-function buildQuestionAnswerPrompt(questions: string[], answer: string): string {
-  return [
-    "你刚才向用户追问了这些补充信息：",
-    ...questions.map((question, index) => `${index + 1}. ${question}`),
-    "",
-    "用户的统一回复如下：",
-    answer,
-    "",
-    "请基于这些补充信息继续完成刚才的任务，不要重复追问相同内容。",
-  ].join("\n");
+function buildQuestionAnswerPrompt(questions: string[], answer: PromptInput): PromptInput {
+  return {
+    text: [
+      "你刚才向用户追问了这些补充信息：",
+      ...questions.map((question, index) => `${index + 1}. ${question}`),
+      "",
+      "用户的统一回复如下：",
+      answer.text,
+      "",
+      "请基于这些补充信息继续完成刚才的任务，不要重复追问相同内容。",
+    ].join("\n"),
+    imagePaths: answer.imagePaths,
+  };
 }
 
-async function promptWithRecovery(chatId: string, directory: string, sessionId: string, prompt: string): Promise<Awaited<ReturnType<OpencodeDaemon["prompt"]>>> {
+async function promptWithRecovery(chatId: string, directory: string, sessionId: string | undefined, prompt: PromptInput): Promise<BackendPromptResponse> {
   try {
-    return await opencode.prompt(directory, sessionId, prompt);
+    return await backend.prompt(directory, sessionId, prompt);
   } catch (error) {
-    if (!isSessionNotFoundError(error)) {
+    if (!sessionId || !backend.isSessionNotFoundError(error)) {
       throw error;
     }
 
     await logLine(`[session] recreate chat=${chatId} old_session=${sessionId}`);
-    const newSessionId = await opencode.createSession(directory, `Feishu ${chatId}`);
-    await state.updateBinding(chatId, { sessionId: newSessionId });
-    return await opencode.prompt(directory, newSessionId, prompt);
+    const newSessionId = await backend.createSession(directory, `Feishu ${chatId}`);
+    return await backend.prompt(directory, newSessionId, prompt);
   }
 }
 
-function isSessionNotFoundError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  if (/Session not found/i.test(message)) {
-    return true;
-  }
-  try {
-    const parsed = JSON.parse(message) as { message?: string };
-    return typeof parsed.message === "string" && /Session not found/i.test(parsed.message);
-  } catch {
-    return false;
-  }
-}
-
-async function buildInboundPrompt(chatId: string, data: any, boundDirectory?: string): Promise<string | undefined> {
+async function buildInboundPrompt(chatId: string, data: any, boundDirectory?: string): Promise<PromptInput | undefined> {
   const messageType = feishu.getMessageType(data);
   if (messageType === "file") {
     return await buildFilePrompt(chatId, data, boundDirectory);
@@ -644,17 +628,19 @@ async function buildInboundPrompt(chatId: string, data: any, boundDirectory?: st
   if (messageType === "post") {
     return await buildPostPrompt(chatId, data, boundDirectory);
   }
-  return feishu.extractText(data);
+  const text = feishu.extractText(data);
+  return text ? { text } : undefined;
 }
 
-async function buildPostPrompt(chatId: string, data: any, boundDirectory?: string): Promise<string | undefined> {
+async function buildPostPrompt(chatId: string, data: any, boundDirectory?: string): Promise<PromptInput | undefined> {
   const post = feishu.extractPost(data);
   if (!post) {
-    return feishu.extractText(data);
+    const text = feishu.extractText(data);
+    return text ? { text } : undefined;
   }
 
   if (post.images.length === 0) {
-    return post.text;
+    return post.text ? { text: post.text } : undefined;
   }
 
   const messageId = feishu.getMessageId(data);
@@ -664,11 +650,13 @@ async function buildPostPrompt(chatId: string, data: any, boundDirectory?: strin
 
   const uploadRoot = await ensureUploadRoot(chatId, boundDirectory);
   const imagePrompts: string[] = [];
+  const imagePaths: string[] = [];
 
   for (const [index, image] of post.images.entries()) {
     const suffix = post.images.length === 1 ? "image.png" : `image-${index + 1}.png`;
     const savedPath = path.join(uploadRoot, `${Date.now()}-${messageId.slice(0, 8)}-${suffix}`);
     await feishu.downloadImageFromMessage(messageId, image.imageKey, savedPath);
+    imagePaths.push(savedPath);
     imagePrompts.push([
       `富文本图片 ${index + 1} 已保存到：${savedPath}`,
       "如果你具备处理图片的能力或可用工具，请使用这张图片继续完成用户任务；否则明确说明限制。",
@@ -676,14 +664,17 @@ async function buildPostPrompt(chatId: string, data: any, boundDirectory?: strin
     ].join("\n"));
   }
 
-  return [
-    post.text ? `用户文字：${post.text}` : undefined,
-    "用户发送了一条带图片的富文本消息。",
-    ...imagePrompts,
-  ].filter(Boolean).join("\n\n");
+  return {
+    text: [
+      post.text ? `用户文字：${post.text}` : undefined,
+      "用户发送了一条带图片的富文本消息。",
+      ...imagePrompts,
+    ].filter(Boolean).join("\n\n"),
+    imagePaths,
+  };
 }
 
-async function buildFilePrompt(chatId: string, data: any, boundDirectory?: string): Promise<string> {
+async function buildFilePrompt(chatId: string, data: any, boundDirectory?: string): Promise<PromptInput> {
   const file = feishu.extractFile(data);
   const messageId = feishu.getMessageId(data);
   if (!file || !messageId) {
@@ -699,15 +690,17 @@ async function buildFilePrompt(chatId: string, data: any, boundDirectory?: strin
   const savedPath = path.join(uploadRoot, `${Date.now()}-${messageId.slice(0, 8)}-${safeName}`);
   await feishu.downloadFileFromMessage(messageId, file.fileKey, savedPath);
 
-  return [
-    "用户刚刚通过飞书上传了一个文件。",
-    `原始文件名：${file.fileName ?? safeName}`,
-    `文件已保存到：${savedPath}`,
-    "请先读取并使用这个文件，再继续处理用户的任务。",
-  ].join("\n");
+  return {
+    text: [
+      "用户刚刚通过飞书上传了一个文件。",
+      `原始文件名：${file.fileName ?? safeName}`,
+      `文件已保存到：${savedPath}`,
+      "请先读取并使用这个文件，再继续处理用户的任务。",
+    ].join("\n"),
+  };
 }
 
-async function buildImagePrompt(chatId: string, data: any, boundDirectory?: string): Promise<string> {
+async function buildImagePrompt(chatId: string, data: any, boundDirectory?: string): Promise<PromptInput> {
   const image = feishu.extractImage(data);
   const messageId = feishu.getMessageId(data);
   if (!image || !messageId) {
@@ -718,15 +711,18 @@ async function buildImagePrompt(chatId: string, data: any, boundDirectory?: stri
   const savedPath = path.join(uploadRoot, `${Date.now()}-${messageId.slice(0, 8)}-image.png`);
   await feishu.downloadImageFromMessage(messageId, image.imageKey, savedPath);
 
-  return [
-    "用户刚刚通过飞书发送了一张图片。",
-    `图片已保存到：${savedPath}`,
-    "如果你具备处理图片的能力或可用工具，请使用这张图片继续完成用户任务；否则明确说明限制。",
-    `本地图片路径：${savedPath}`,
-  ].join("\n");
+  return {
+    text: [
+      "用户刚刚通过飞书发送了一张图片。",
+      `图片已保存到：${savedPath}`,
+      "如果你具备处理图片的能力或可用工具，请使用这张图片继续完成用户任务；否则明确说明限制。",
+      `本地图片路径：${savedPath}`,
+    ].join("\n"),
+    imagePaths: [savedPath],
+  };
 }
 
-async function buildMediaPrompt(chatId: string, data: any, boundDirectory?: string): Promise<string> {
+async function buildMediaPrompt(chatId: string, data: any, boundDirectory?: string): Promise<PromptInput> {
   const media = feishu.extractMedia(data);
   const messageId = feishu.getMessageId(data);
   if (!media || !messageId) {
@@ -738,15 +734,17 @@ async function buildMediaPrompt(chatId: string, data: any, boundDirectory?: stri
   const savedPath = path.join(uploadRoot, `${Date.now()}-${messageId.slice(0, 8)}-${safeName}`);
   await feishu.downloadMediaFromMessage(messageId, media.fileKey, savedPath);
 
-  return [
-    "用户刚刚通过飞书发送了一个视频或音频文件。",
-    `原始文件名：${media.fileName ?? safeName}`,
-    media.duration ? `时长：${media.duration} ms` : undefined,
-    `文件已保存到：${savedPath}`,
-    media.imageKey ? "该消息还带有封面图，可按需进一步获取。" : undefined,
-    "如果你具备处理视频或音频的能力或可用工具，请使用这个文件继续完成用户任务；否则明确说明限制。",
-    `本地媒体路径：${savedPath}`,
-  ].filter(Boolean).join("\n");
+  return {
+    text: [
+      "用户刚刚通过飞书发送了一个视频或音频文件。",
+      `原始文件名：${media.fileName ?? safeName}`,
+      media.duration ? `时长：${media.duration} ms` : undefined,
+      `文件已保存到：${savedPath}`,
+      media.imageKey ? "该消息还带有封面图，可按需进一步获取。" : undefined,
+      "如果你具备处理视频或音频的能力或可用工具，请使用这个文件继续完成用户任务；否则明确说明限制。",
+      `本地媒体路径：${savedPath}`,
+    ].filter(Boolean).join("\n"),
+  };
 }
 
 async function ensureUploadRoot(chatId: string, boundDirectory?: string): Promise<string> {
@@ -774,7 +772,7 @@ function formatQuestions(questions: string[]): string {
 
 function shutdown(): void {
   feishu.close();
-  opencode.close();
+  backend.close();
 
   const pending = Array.from(queues.values());
   if (pending.length === 0) {

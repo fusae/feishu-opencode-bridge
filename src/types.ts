@@ -1,3 +1,5 @@
+import type { PromptInput } from "./backend.js";
+
 export interface BridgeEnv {
   feishuAppId: string;
   feishuAppSecret: string;
@@ -8,11 +10,16 @@ export interface BridgeEnv {
   stateFilePath: string;
   groupRequireMention: boolean;
   pageSize: number;
+  backend: "opencode" | "codex";
   opencodeServerHostname: string;
   opencodeServerPort: number;
   opencodeServerPassword?: string;
   opencodeServerUsername: string;
   opencodeSystemPrompt?: string;
+  codexCommand: string;
+  codexModel?: string;
+  codexProfile?: string;
+  codexSandbox: "read-only" | "workspace-write" | "danger-full-access";
 }
 
 export interface ChatBinding {
@@ -23,7 +30,7 @@ export interface ChatBinding {
 export interface PendingSelector {
   page: number;
   query: string;
-  pendingPrompt?: string;
+  pendingPrompt?: PromptInput;
 }
 
 export interface PendingQuestion {

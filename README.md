@@ -1,11 +1,11 @@
 # Feishu OpenCode Bridge
 
-Connect a Feishu bot to [OpenCode](https://opencode.ai/) with:
+Connect a Feishu bot to [OpenCode](https://opencode.ai/) or Codex with:
 
 - Feishu persistent connection mode
 - interactive project picker from your configured projects root
 - per-chat directory binding
-- per-chat OpenCode session reuse
+- per-chat backend session reuse
 
 This project is useful when you want to talk to different local codebases from Feishu without manually switching directories in a terminal.
 
@@ -14,7 +14,7 @@ This project is useful when you want to talk to different local codebases from F
 1. A user sends a message to the Feishu bot.
 2. If the chat is not bound yet, the bridge scans `PROJECTS_ROOT` and sends a project picker card.
 3. After a project is selected, the chat is bound to that directory.
-4. The bridge starts or reuses one OpenCode session for that chat and directory.
+4. The bridge starts or reuses one backend session for that chat and directory.
 5. Later messages in the same chat continue in the same session.
 
 ## Features
@@ -23,13 +23,12 @@ This project is useful when you want to talk to different local codebases from F
 - Feishu card action events via persistent connection
 - project selection buttons with pagination
 - fallback text commands for switching and searching
-- one OpenCode server process managed by the bridge
-- one OpenCode session per Feishu chat
+- one backend session per Feishu chat
 
 ## Requirements
 
 - Node.js 22+
-- `opencode` installed and available in `PATH`
+- `opencode` or `codex` installed and available in `PATH`
 - a Feishu self-built app with bot capability enabled
 
 ## Installation
@@ -55,18 +54,25 @@ PROJECTS_ROOT=/path/to/projects
 PROJECT_PAGE_SIZE=12
 STATE_FILE_PATH=./data/state.json
 GROUP_REQUIRE_MENTION=true
+BRIDGE_BACKEND=opencode
 OPENCODE_SERVER_HOSTNAME=127.0.0.1
 OPENCODE_SERVER_PORT=4096
 OPENCODE_SERVER_USERNAME=opencode
 OPENCODE_SERVER_PASSWORD=
 OPENCODE_SYSTEM_PROMPT=You are helping with the currently bound project. Give the answer first, then the necessary detail.
+CODEX_COMMAND=codex
+CODEX_MODEL=
+CODEX_PROFILE=
+CODEX_SANDBOX=workspace-write
 ```
 
 Notes:
 
 - `PROJECTS_ROOT` is scanned for first-level subdirectories.
 - `GROUP_REQUIRE_MENTION=true` means the bot only reacts when mentioned in group chats.
+- `BRIDGE_BACKEND=opencode|codex` selects the backend.
 - `OPENCODE_SERVER_PASSWORD` is optional. If set, the bridge uses HTTP Basic Auth when talking to `opencode serve`.
+- `CODEX_SANDBOX` is only used when `BRIDGE_BACKEND=codex`.
 
 ## Run
 
@@ -103,7 +109,7 @@ No separate public webhook endpoint is required for this bridge.
 ```text
 /switch    Open the project picker again
 /status    Show the currently bound directory
-/reset     Reset the current OpenCode session for this chat
+/reset     Reset the current backend session for this chat
 /session   List sessions for the current project
 /session current
 /session new
@@ -154,7 +160,7 @@ It keeps:
 ## Current Behavior
 
 - one Feishu chat maps to one project directory
-- one Feishu chat maps to one OpenCode session inside that directory
+- one Feishu chat maps to one backend session inside that directory
 - messages in the same chat are processed serially to preserve session order
 - project picker uses buttons, with text-command fallback still available
 
@@ -164,12 +170,12 @@ If the bot does not reply:
 
 - confirm the Feishu app is using persistent connection mode
 - confirm both `im.message.receive_v1` and `card.action.trigger` are subscribed
-- confirm `opencode` is installed and callable from the shell
+- confirm the selected backend CLI is installed and callable from the shell
 - confirm `FEISHU_APP_ID` and `FEISHU_APP_SECRET` are correct
 - inspect bridge logs from `npm run dev`
 
 If replies are slow:
 
-- the bridge waits for OpenCode to finish before replying
+- the bridge waits for the selected backend to finish before replying
 - messages from the same chat are queued in order
 - large repositories or tool-heavy prompts may take noticeably longer

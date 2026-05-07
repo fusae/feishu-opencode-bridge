@@ -33,6 +33,22 @@ function toInt(value: string | undefined, fallback: number, name: string): numbe
   return parsed;
 }
 
+function toBackend(value: string | undefined): "opencode" | "codex" {
+  const normalized = value?.trim().toLowerCase() || "opencode";
+  if (normalized === "opencode" || normalized === "codex") {
+    return normalized;
+  }
+  throw new Error(`Invalid BRIDGE_BACKEND: ${value}`);
+}
+
+function toCodexSandbox(value: string | undefined): "read-only" | "workspace-write" | "danger-full-access" {
+  const normalized = value?.trim() || "workspace-write";
+  if (normalized === "read-only" || normalized === "workspace-write" || normalized === "danger-full-access") {
+    return normalized;
+  }
+  throw new Error(`Invalid CODEX_SANDBOX: ${value}`);
+}
+
 function resolveHome(input: string): string {
   if (input === "~") {
     return os.homedir();
@@ -59,10 +75,15 @@ export function loadEnv(): BridgeEnv {
     stateFilePath: path.resolve(process.cwd(), process.env.STATE_FILE_PATH?.trim() || "./data/state.json"),
     groupRequireMention: toBool(process.env.GROUP_REQUIRE_MENTION, true),
     pageSize: toInt(process.env.PROJECT_PAGE_SIZE, 12, "PROJECT_PAGE_SIZE"),
+    backend: toBackend(process.env.BRIDGE_BACKEND),
     opencodeServerHostname: process.env.OPENCODE_SERVER_HOSTNAME?.trim() || "127.0.0.1",
     opencodeServerPort: toInt(process.env.OPENCODE_SERVER_PORT, 4096, "OPENCODE_SERVER_PORT"),
     opencodeServerPassword: process.env.OPENCODE_SERVER_PASSWORD?.trim() || undefined,
     opencodeServerUsername: process.env.OPENCODE_SERVER_USERNAME?.trim() || "opencode",
     opencodeSystemPrompt: process.env.OPENCODE_SYSTEM_PROMPT?.trim() || undefined,
+    codexCommand: process.env.CODEX_COMMAND?.trim() || "codex",
+    codexModel: process.env.CODEX_MODEL?.trim() || undefined,
+    codexProfile: process.env.CODEX_PROFILE?.trim() || undefined,
+    codexSandbox: toCodexSandbox(process.env.CODEX_SANDBOX),
   };
 }
