@@ -158,6 +158,12 @@ async function handleMessage(chatId: string, data: any): Promise<void> {
 async function handleCommand(chatId: string, text: string): Promise<boolean> {
   const trimmed = text.trim();
   const normalized = trimmed.toLowerCase();
+  const pickerAction = parsePickerCommand(trimmed);
+
+  if (pickerAction && pickerAction.chatId === chatId) {
+    await handleCardAction(pickerAction);
+    return true;
+  }
 
   if (trimmed === "/switch") {
     await state.clearBinding(chatId);
@@ -176,7 +182,7 @@ async function handleCommand(chatId: string, text: string): Promise<boolean> {
     return true;
   }
 
-  if (trimmed === "/reset") {
+  if (trimmed === "/reset" || trimmed === "/new") {
     const binding = await getResolvedBinding(chatId);
     if (!binding) {
       await feishu.sendText(chatId, "当前没有可重置的会话。");
@@ -241,6 +247,42 @@ async function handleCommand(chatId: string, text: string): Promise<boolean> {
   }
 
   return false;
+}
+
+function parsePickerCommand(text: string): CardActionValue | null {
+  if (!text.startsWith("/picker ")) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(text.slice("/picker ".length));
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    const record = parsed as Record<string, unknown>;
+    if (
+      record.action !== "select_project" &&
+      record.action !== "selector_prev" &&
+      record.action !== "selector_next" &&
+      record.action !== "selector_refresh"
+    ) {
+      return null;
+    }
+    if (typeof record.chatId !== "string" || !record.chatId.trim()) {
+      return null;
+    }
+    if (record.path !== undefined && typeof record.path !== "string") {
+      return null;
+    }
+
+    return {
+      action: record.action,
+      chatId: record.chatId,
+      path: typeof record.path === "string" ? record.path : undefined,
+    };
+  } catch {
+    return null;
+  }
 }
 
 async function handleSessionCommand(chatId: string, text: string): Promise<boolean> {

@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import { execFile as execFileCallback } from "node:child_process";
+import { execFile as execFileCallback, spawn } from "node:child_process";
 import { mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { logLine } from "./logger.js";
@@ -8,6 +8,9 @@ import type { AgentBackend, BackendPromptResponse, PromptInput, SessionInfo } fr
 import type { BridgeEnv } from "./types.js";
 
 const execFile = promisify(execFileCallback);
+const OUTPUT_POLL_INTERVAL_MS = 200;
+const OUTPUT_POLL_TIMEOUT_MS = 2 * 60_000;
+const PROCESS_SHUTDOWN_GRACE_MS = 500;
 
 type CodexSessionRecord = SessionInfo & {
   filePath: string;
@@ -130,18 +133,66 @@ export class CodexDaemon implements AgentBackend {
     if (this.env.codexModel) {
       args.push("-m", this.env.codexModel);
     }
+    if (this.env.codexProfile) {
+      args.push("-p", this.env.codexProfile);
+    }
     return args;
   }
 
   private async runCodex(args: string[]): Promise<{ stdout: string; stderr: string }> {
-    try {
-      return await execFile(this.env.codexCommand, args, {
-        maxBuffer: 10 * 1024 * 1024,
+    const outputFile = this.extractOutputFile(args);
+    const child = spawn(this.env.codexCommand, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let exitCode: number | null = null;
+    let exitSignal: NodeJS.Signals | null = null;
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    const exitPromise = new Promise<void>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code, signal) => {
+        exitCode = code;
+        exitSignal = signal;
+        resolve();
       });
+    });
+
+    try {
+      await this.waitForOutput(outputFile, exitPromise);
+      settled = true;
+      this.stopChild(child);
+      await this.waitForShutdown(exitPromise);
+      return {
+        stdout,
+        stderr,
+      };
     } catch (error) {
-      const stderr = typeof (error as any)?.stderr === "string" ? (error as any).stderr.trim() : "";
-      const stdout = typeof (error as any)?.stdout === "string" ? (error as any).stdout.trim() : "";
-      throw new Error(stderr || stdout || (error instanceof Error ? error.message : String(error)));
+      settled = true;
+      this.stopChild(child);
+      await this.waitForShutdown(exitPromise);
+      const trimmedStderr = stderr.trim();
+      const trimmedStdout = stdout.trim();
+      if (exitCode && exitCode !== 0) {
+        throw new Error(trimmedStderr || trimmedStdout || `codex exited with code ${exitCode}`);
+      }
+      if (exitSignal) {
+        throw new Error(trimmedStderr || trimmedStdout || `codex exited with signal ${exitSignal}`);
+      }
+      throw new Error(trimmedStderr || trimmedStdout || (error instanceof Error ? error.message : String(error)));
+    } finally {
+      if (!settled) {
+        this.stopChild(child);
+      }
     }
   }
 
@@ -176,6 +227,71 @@ export class CodexDaemon implements AgentBackend {
   private async createOutputFile(): Promise<string> {
     const dir = await mkdtemp(path.join(os.tmpdir(), "feishu-codex-"));
     return path.join(dir, "last-message.txt");
+  }
+
+  private extractOutputFile(args: string[]): string {
+    const index = args.indexOf("-o");
+    if (index >= 0 && typeof args[index + 1] === "string") {
+      return args[index + 1]!;
+    }
+    throw new Error("codex output file is missing");
+  }
+
+  private async waitForOutput(outputFile: string, exitPromise: Promise<void>): Promise<string> {
+    const deadline = Date.now() + OUTPUT_POLL_TIMEOUT_MS;
+
+    while (Date.now() < deadline) {
+      const exited = await Promise.race([
+        exitPromise.then(() => true),
+        sleep(OUTPUT_POLL_INTERVAL_MS).then(() => false),
+      ]);
+
+      const content = await this.readTrimmedFile(outputFile);
+      if (content) {
+        return content;
+      }
+
+      if (exited) {
+        break;
+      }
+    }
+
+    const finalContent = await this.readTrimmedFile(outputFile);
+    if (finalContent) {
+      return finalContent;
+    }
+    throw new Error("codex returned empty text response");
+  }
+
+  private async readTrimmedFile(filePath: string): Promise<string> {
+    try {
+      return (await readFile(filePath, "utf8")).trim();
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
+        return "";
+      }
+      throw error;
+    }
+  }
+
+  private stopChild(child: ReturnType<typeof spawn>): void {
+    if (child.killed) {
+      return;
+    }
+    child.kill("SIGTERM");
+    setTimeout(() => {
+      if (!child.killed) {
+        child.kill("SIGKILL");
+      }
+    }, PROCESS_SHUTDOWN_GRACE_MS).unref();
+  }
+
+  private async waitForShutdown(exitPromise: Promise<void>): Promise<void> {
+    await Promise.race([
+      exitPromise,
+      sleep(PROCESS_SHUTDOWN_GRACE_MS + 250),
+    ]);
   }
 
   private async readSessions(): Promise<CodexSessionRecord[]> {
@@ -245,4 +361,8 @@ async function walkJsonlFiles(root: string): Promise<string[]> {
 async function readFirstLine(filePath: string): Promise<string | undefined> {
   const raw = await readFile(filePath, "utf8");
   return raw.split("\n", 1)[0];
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

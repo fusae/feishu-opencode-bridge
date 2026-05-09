@@ -501,11 +501,11 @@ export class FeishuBridgeClient {
                 content: `选择 ${index + 1}`,
               },
               type: "primary",
-              value: {
+              value: buildCardActionValue({
                 action: "select_project",
                 chatId,
                 path: item.path,
-              },
+              }),
             },
           ],
         });
@@ -521,10 +521,10 @@ export class FeishuBridgeClient {
             tag: "plain_text",
             content: "上一页",
           },
-          value: {
+          value: buildCardActionValue({
             action: "selector_prev",
             chatId,
-          },
+          }),
         },
         {
           tag: "button",
@@ -532,10 +532,10 @@ export class FeishuBridgeClient {
             tag: "plain_text",
             content: "下一页",
           },
-          value: {
+          value: buildCardActionValue({
             action: "selector_next",
             chatId,
-          },
+          }),
         },
         {
           tag: "button",
@@ -543,10 +543,10 @@ export class FeishuBridgeClient {
             tag: "plain_text",
             content: "刷新",
           },
-          value: {
+          value: buildCardActionValue({
             action: "selector_refresh",
             chatId,
-          },
+          }),
         },
       ],
     });
@@ -664,10 +664,59 @@ export class FeishuBridgeClient {
 }
 
 function parseCardActionValue(value: unknown): CardActionValue | null {
-  if (!value || typeof value !== "object") {
+  if (value && typeof value === "object") {
+    const command = (value as Record<string, unknown>).command;
+    if (typeof command === "string") {
+      return parsePickerCommand(command);
+    }
+  }
+
+  let record: Record<string, unknown> | null = null;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === "object") {
+        record = parsed as Record<string, unknown>;
+      }
+    } catch {
+      return null;
+    }
+  } else if (value && typeof value === "object") {
+    record = value as Record<string, unknown>;
+  }
+  if (!record) {
     return null;
   }
-  const record = value as Record<string, unknown>;
+  return normalizeCardActionRecord(record);
+}
+
+function buildCardActionValue(value: CardActionValue): Record<string, string> {
+  return {
+    command: encodePickerCommand(value),
+  };
+}
+
+function encodePickerCommand(value: CardActionValue): string {
+  return `/picker ${JSON.stringify(value)}`;
+}
+
+function parsePickerCommand(text: string): CardActionValue | null {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("/picker ")) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(trimmed.slice("/picker ".length));
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    return normalizeCardActionRecord(parsed as Record<string, unknown>);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeCardActionRecord(record: Record<string, unknown>): CardActionValue | null {
   if (
     record.action !== "select_project" &&
     record.action !== "selector_prev" &&
