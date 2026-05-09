@@ -215,7 +215,12 @@ export class FeishuBridgeClient {
           await logLine(`[ws] inbound type=card.action.trigger token=${typeof (event as any)?.token === "string" ? (event as any).token : ""}`);
           const value = parseCardActionValue((event as any)?.action?.value);
           if (!value) {
-            return {};
+            return {
+              toast: {
+                type: "warning",
+                content: "无法识别卡片操作",
+              },
+            };
           }
 
           void (async () => {
@@ -232,7 +237,12 @@ export class FeishuBridgeClient {
             }
           })();
 
-          return {};
+          return {
+            toast: {
+              type: "info",
+              content: "处理中...",
+            },
+          };
         }
       });
 
