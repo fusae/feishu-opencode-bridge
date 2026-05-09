@@ -215,19 +215,24 @@ export class FeishuBridgeClient {
           await logLine(`[ws] inbound type=card.action.trigger token=${typeof (event as any)?.token === "string" ? (event as any).token : ""}`);
           const value = parseCardActionValue((event as any)?.action?.value);
           if (!value) {
-            return;
+            return {};
           }
-          try {
-            await params.onCardAction(event, value);
-          } catch (error) {
-            const chatId =
-              typeof (event as any)?.context?.chat_id === "string"
-                ? (event as any).context.chat_id
-                : value.chatId;
-            if (chatId) {
-              await this.sendText(chatId, `处理卡片动作失败：${formatError(error)}`);
+
+          void (async () => {
+            try {
+              await params.onCardAction(event, value);
+            } catch (error) {
+              const chatId =
+                typeof (event as any)?.context?.chat_id === "string"
+                  ? (event as any).context.chat_id
+                  : value.chatId;
+              if (chatId) {
+                await this.sendText(chatId, `处理卡片动作失败：${formatError(error)}`);
+              }
             }
-          }
+          })();
+
+          return {};
         }
       });
 
